@@ -1800,39 +1800,30 @@ void updateDynamicValues() {
   }
   tft.drawString(buf, 115, 46);
 
-  // Suhu Udara - jika OFFLINE tampilkan "--.-"
-  if (n1IsOnline && !isnan(n1Snap.temperature)) {
-    tft.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  // Suhu Udara - Tetap tampilkan nilai terakhir meskipun sensor offline
+  if (!isnan(n1Snap.temperature)) {
+    tft.setTextColor(n1IsOnline ? COLOR_TEXT : COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "%5.1f C     ", n1Snap.temperature);
-  } else if (!n1IsOnline && n1HasEverSeen) {
-    tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.- C [off]");
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), " --.- C     ");
   }
   tft.drawString(buf, 115, 64);
 
-  // Lembap Udara
-  if (n1IsOnline && !isnan(n1Snap.humidity)) {
-    tft.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  // Lembap Udara - Tetap tampilkan nilai terakhir
+  if (!isnan(n1Snap.humidity)) {
+    tft.setTextColor(n1IsOnline ? COLOR_TEXT : COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "%5.1f %%     ", n1Snap.humidity);
-  } else if (!n1IsOnline && n1HasEverSeen) {
-    tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.- %% [off]");
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), " --.- %%     ");
   }
   tft.drawString(buf, 115, 82);
 
-  // Lembap Tanah
-  if (n1IsOnline && !isnan(n1Snap.soil_moisture)) {
-    tft.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  // Lembap Tanah - Tetap tampilkan nilai terakhir
+  if (!isnan(n1Snap.soil_moisture)) {
+    tft.setTextColor(n1IsOnline ? COLOR_TEXT : COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "%5.1f %%     ", n1Snap.soil_moisture);
-  } else if (!n1IsOnline && n1HasEverSeen) {
-    tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.- %% [off]");
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), " --.- %%     ");
@@ -1857,8 +1848,9 @@ void updateDynamicValues() {
   } else if (n1Snap.lastSeen > 0) {
     tft.setTextColor(COLOR_RED, COLOR_CARD_BG);
     unsigned long agoSec1 = (millis() - n1Snap.lastSeen) / 1000UL;
-    if (agoSec1 < 3600) snprintf(buf, sizeof(buf), "OFFL #%-4lu %lus!", (unsigned long)n1Snap.counter, agoSec1);
-    else                snprintf(buf, sizeof(buf), "OFFL #%-4lu %lum!", (unsigned long)n1Snap.counter, agoSec1 / 60);
+    if (agoSec1 < 60)        snprintf(buf, sizeof(buf), "OFFL #%-4lu %2lus lalu", (unsigned long)n1Snap.counter, agoSec1);
+    else if (agoSec1 < 3600) snprintf(buf, sizeof(buf), "OFFL #%-4lu %2lum lalu", (unsigned long)n1Snap.counter, agoSec1 / 60);
+    else                     snprintf(buf, sizeof(buf), "OFFL #%-4lu %2luh lalu", (unsigned long)n1Snap.counter, agoSec1 / 3600);
   } else if (n1Snap.active) {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "#%-4lu| Memori NVS ", (unsigned long)n1Snap.counter);
@@ -1889,46 +1881,37 @@ void updateDynamicValues() {
   }
   tft.drawString(buf, 351, 46);
 
-  // Suhu Udara
-  if (n2IsOnline && !isnan(n2Snap.temperature)) {
-    tft.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  // Suhu Udara - Tetap tampilkan nilai terakhir meskipun sensor offline
+  if (!isnan(n2Snap.temperature)) {
+    tft.setTextColor(n2IsOnline ? COLOR_TEXT : COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "%5.1f C     ", n2Snap.temperature);
-  } else if (!n2IsOnline && n2HasEverSeen) {
-    tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.- C [off]");
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), " --.- C     ");
   }
   tft.drawString(buf, 351, 64);
 
-  // Lembap Udara
-  if (n2IsOnline && !isnan(n2Snap.humidity)) {
-    tft.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  // Lembap Udara - Tetap tampilkan nilai terakhir
+  if (!isnan(n2Snap.humidity)) {
+    tft.setTextColor(n2IsOnline ? COLOR_TEXT : COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "%5.1f %%     ", n2Snap.humidity);
-  } else if (!n2IsOnline && n2HasEverSeen) {
-    tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.- %% [off]");
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), " --.- %%     ");
   }
   tft.drawString(buf, 351, 82);
 
-  // Lembap Tanah
-  if (n2IsOnline && !isnan(n2Snap.soil_moisture)) {
-    tft.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  // Lembap Tanah - Tetap tampilkan nilai terakhir
+  if (!isnan(n2Snap.soil_moisture)) {
+    tft.setTextColor(n2IsOnline ? COLOR_TEXT : COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "%5.1f %%     ", n2Snap.soil_moisture);
-  } else if (!n2IsOnline && n2HasEverSeen) {
-    tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.- %% [off]");
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), " --.- %%     ");
   }
   tft.drawString(buf, 351, 100);
 
-  // Baterai Node 2
+  // Baterai Node 2 (selalu tampilkan nilai terakhir)
   if (!isnan(n2Snap.battery)) {
     tft.setTextColor((n2Snap.battery >= 3.6f) ? (n2IsOnline ? COLOR_ACCENT : COLOR_TEXT_MUTED) : COLOR_ORANGE, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "%5.2f V     ", n2Snap.battery);
@@ -1946,8 +1929,9 @@ void updateDynamicValues() {
   } else if (n2Snap.lastSeen > 0) {
     tft.setTextColor(COLOR_RED, COLOR_CARD_BG);
     unsigned long agoSec2 = (millis() - n2Snap.lastSeen) / 1000UL;
-    if (agoSec2 < 3600) snprintf(buf, sizeof(buf), "OFFL #%-4lu %lus!", (unsigned long)n2Snap.counter, agoSec2);
-    else                snprintf(buf, sizeof(buf), "OFFL #%-4lu %lum!", (unsigned long)n2Snap.counter, agoSec2 / 60);
+    if (agoSec2 < 60)        snprintf(buf, sizeof(buf), "OFFL #%-4lu %2lus lalu", (unsigned long)n2Snap.counter, agoSec2);
+    else if (agoSec2 < 3600) snprintf(buf, sizeof(buf), "OFFL #%-4lu %2lum lalu", (unsigned long)n2Snap.counter, agoSec2 / 60);
+    else                     snprintf(buf, sizeof(buf), "OFFL #%-4lu %2luh lalu", (unsigned long)n2Snap.counter, agoSec2 / 3600);
   } else if (n2Snap.active) {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     snprintf(buf, sizeof(buf), "#%-4lu| Memori NVS ", (unsigned long)n2Snap.counter);
@@ -1978,15 +1962,12 @@ void updateDynamicValues() {
   }
   tft.drawString(buf, 115, 174);
 
-  // Suhu Tanah Gambut (DS18B20 Probe) - sensor kritis, tampil berubah saat offline
-  if (!n3IsOnline && n3HasEverSeen) {
-    tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.-- C [OFF] ");
-    tft.drawString(buf, 115, 192);
-  } else if (!isnan(n3Snap.soil_temp)) {
+  // Suhu Tanah Gambut (DS18B20 Probe) - Tetap tampilkan nilai terakhir meskipun offline
+  if (!isnan(n3Snap.soil_temp)) {
     snprintf(buf, sizeof(buf), "%5.2f C     ", n3Snap.soil_temp);
     uint16_t cColor = (n3Snap.soil_temp >= 50.0f) ? COLOR_RED :
-                      (n3Snap.soil_temp >= 40.0f) ? COLOR_ORANGE : COLOR_ACCENT;
+                      (n3Snap.soil_temp >= 40.0f) ? COLOR_ORANGE :
+                      (n3IsOnline ? COLOR_ACCENT : COLOR_TEXT_MUTED);
     tft.setTextColor(cColor, COLOR_CARD_BG);
     tft.drawString(buf, 115, 192);
   } else {
@@ -1996,18 +1977,20 @@ void updateDynamicValues() {
   }
 
   // Status Bara Smoldering
-  if (!n3IsOnline && n3HasEverSeen) {
-    tft.setTextColor(COLOR_RED, COLOR_CARD_BG);
-    tft.drawString("[NO DATA-OFFL]   ", 115, 210);
-  } else if (!isnan(n3Snap.soil_temp) && n3Snap.soil_temp >= 50.0f) {
+  if (!isnan(n3Snap.soil_temp) && n3Snap.soil_temp >= 50.0f) {
     tft.setTextColor(COLOR_RED, COLOR_CARD_BG);
     tft.drawString("[DARURAT BARA]   ", 115, 210);
   } else if (!isnan(n3Snap.soil_temp) && n3Snap.soil_temp >= 40.0f) {
     tft.setTextColor(COLOR_ORANGE, COLOR_CARD_BG);
     tft.drawString("[WASPADA PANAS]  ", 115, 210);
   } else if (!isnan(n3Snap.soil_temp)) {
-    tft.setTextColor(COLOR_ACCENT, COLOR_CARD_BG);
-    tft.drawString("[NORMAL/AMAN]    ", 115, 210);
+    if (n3IsOnline) {
+      tft.setTextColor(COLOR_ACCENT, COLOR_CARD_BG);
+      tft.drawString("[NORMAL/AMAN]    ", 115, 210);
+    } else {
+      tft.setTextColor(COLOR_YELLOW, COLOR_CARD_BG);
+      tft.drawString("[TERAKHIR AMAN]  ", 115, 210);
+    }
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
     tft.drawString("[MENUNGGU PROBE] ", 115, 210);
@@ -2037,7 +2020,10 @@ void updateDynamicValues() {
   if (!isnan(n3Snap.battery)) {
     tft.setTextColor((n3Snap.battery >= 3.6f) ? (n3IsOnline ? COLOR_ACCENT : COLOR_TEXT_MUTED) : COLOR_ORANGE, COLOR_CARD_BG);
     if (!n3IsOnline && n3HasEverSeen) {
-      snprintf(buf, sizeof(buf), "%4.2fV #%-4lu [OFF]", n3Snap.battery, (unsigned long)n3Snap.counter);
+      unsigned long agoSec3 = (millis() - n3Snap.lastSeen) / 1000UL;
+      if (agoSec3 < 60)        snprintf(buf, sizeof(buf), "%4.2fV|OFFL %2lus lalu", n3Snap.battery, agoSec3);
+      else if (agoSec3 < 3600) snprintf(buf, sizeof(buf), "%4.2fV|OFFL %2lum lalu", n3Snap.battery, agoSec3 / 60);
+      else                     snprintf(buf, sizeof(buf), "%4.2fV|OFFL %2luh lalu", n3Snap.battery, agoSec3 / 3600);
     } else if (n3Snap.lastSeen == 0 && n3Snap.active) {
       snprintf(buf, sizeof(buf), "%4.2f V | #%-4lu[NVS]", n3Snap.battery, (unsigned long)n3Snap.counter);
     } else {
