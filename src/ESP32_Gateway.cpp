@@ -180,6 +180,17 @@ static const uint16_t BMKG_LEVEL_COLOR[] = {
   0xF81F  // DARURAT       = Magenta 🚨
 };
 
+// =====================================================
+// HELPER PERHITUNGAN PERSENTASE BATERAI LI-PO (1S 3.7V)
+// 3.00V = 0% (Cutoff Empty), 4.20V = 100% (Full Charged)
+// =====================================================
+inline int hitungPersenBaterai(float voltage) {
+  if (isnan(voltage) || voltage <= 3.00f) return 0;
+  if (voltage >= 4.20f) return 100;
+  float pct = ((voltage - 3.00f) / (4.20f - 3.00f)) * 100.0f;
+  return (int)constrain(pct, 0.0f, 100.0f);
+}
+
 // Variabel Global Sensor
 NodeData node1;
 NodeData node2;
@@ -517,6 +528,7 @@ void publishNode3Mqtt(const Node3Data& n3) {
     "\"node_id\":3,"
     "\"soil_temp\":%.2f,"        // Suhu Tanah Gambut DS18B20
     "\"battery\":%.2f,"          // Voltase Baterai Node 3
+    "\"battery_pct\":%d,"        // Persentase Baterai Node 3 (Li-Po 1S)
     "\"temperature\":%.1f,"      // Suhu Ambient
     "\"humidity\":%.1f,"         // RH Ambient
     "\"ffmc\":%.2f,"
@@ -531,6 +543,7 @@ void publishNode3Mqtt(const Node3Data& n3) {
     "}",
     isnan(n3.soil_temp)   ? 0.0f : n3.soil_temp,
     isnan(n3.battery)     ? 0.0f : n3.battery,
+    hitungPersenBaterai(n3.battery),
     isnan(n3.temperature) ? 0.0f : n3.temperature,
     isnan(n3.humidity)    ? 0.0f : n3.humidity,
     isnan(n3.ffmc)        ? 0.0f : n3.ffmc,
@@ -1832,11 +1845,13 @@ void updateDynamicValues() {
 
   // Baterai Node 1 (selalu tampilkan nilai terakhir agar bisa diagnosa)
   if (!isnan(n1Snap.battery)) {
-    tft.setTextColor((n1Snap.battery >= 3.6f) ? (n1IsOnline ? COLOR_ACCENT : COLOR_TEXT_MUTED) : COLOR_ORANGE, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), "%5.2f V     ", n1Snap.battery);
+    int pct1 = hitungPersenBaterai(n1Snap.battery);
+    uint16_t bCol1 = (pct1 < 20) ? COLOR_RED : (pct1 < 50) ? COLOR_ORANGE : (n1IsOnline ? COLOR_ACCENT : COLOR_TEXT_MUTED);
+    tft.setTextColor(bCol1, COLOR_CARD_BG);
+    snprintf(buf, sizeof(buf), "%4.2f V (%2d%%)     ", n1Snap.battery, pct1);
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.-- V     ");
+    snprintf(buf, sizeof(buf), " --.-- V (--%%)     ");
   }
   tft.drawString(buf, 115, 118);
 
@@ -1913,11 +1928,13 @@ void updateDynamicValues() {
 
   // Baterai Node 2 (selalu tampilkan nilai terakhir)
   if (!isnan(n2Snap.battery)) {
-    tft.setTextColor((n2Snap.battery >= 3.6f) ? (n2IsOnline ? COLOR_ACCENT : COLOR_TEXT_MUTED) : COLOR_ORANGE, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), "%5.2f V     ", n2Snap.battery);
+    int pct2 = hitungPersenBaterai(n2Snap.battery);
+    uint16_t bCol2 = (pct2 < 20) ? COLOR_RED : (pct2 < 50) ? COLOR_ORANGE : (n2IsOnline ? COLOR_CYAN : COLOR_TEXT_MUTED);
+    tft.setTextColor(bCol2, COLOR_CARD_BG);
+    snprintf(buf, sizeof(buf), "%4.2f V (%2d%%)     ", n2Snap.battery, pct2);
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), " --.-- V     ");
+    snprintf(buf, sizeof(buf), " --.-- V (--%%)     ");
   }
   tft.drawString(buf, 351, 118);
 
@@ -2016,22 +2033,25 @@ void updateDynamicValues() {
   }
   tft.drawString(buf, 115, 246);
 
-  // Baterai & Counter Paket Node 3 — tampilkan nilai terakhir agar bisa diagnosa baterai
+  // Baterai & Counter Paket Node 3 — tampilkan persentase & voltase baterai
   if (!isnan(n3Snap.battery)) {
-    tft.setTextColor((n3Snap.battery >= 3.6f) ? (n3IsOnline ? COLOR_ACCENT : COLOR_TEXT_MUTED) : COLOR_ORANGE, COLOR_CARD_BG);
+    int pct3 = hitungPersenBaterai(n3Snap.battery);
+    uint16_t bCol3 = (pct3 < 20) ? COLOR_RED : (pct3 < 50) ? COLOR_ORANGE : (n3IsOnline ? COLOR_ACCENT : COLOR_TEXT_MUTED);
+    tft.setTextColor(bCol3, COLOR_CARD_BG);
+
     if (!n3IsOnline && n3HasEverSeen) {
       unsigned long agoSec3 = (millis() - n3Snap.lastSeen) / 1000UL;
-      if (agoSec3 < 60)        snprintf(buf, sizeof(buf), "%4.2fV|OFFL %2lus lalu", n3Snap.battery, agoSec3);
-      else if (agoSec3 < 3600) snprintf(buf, sizeof(buf), "%4.2fV|OFFL %2lum lalu", n3Snap.battery, agoSec3 / 60);
-      else                     snprintf(buf, sizeof(buf), "%4.2fV|OFFL %2luh lalu", n3Snap.battery, agoSec3 / 3600);
+      if (agoSec3 < 60)        snprintf(buf, sizeof(buf), "%4.2fV(%2d%%) OFFL%2lus", n3Snap.battery, pct3, agoSec3);
+      else if (agoSec3 < 3600) snprintf(buf, sizeof(buf), "%4.2fV(%2d%%) OFFL%2lum", n3Snap.battery, pct3, agoSec3 / 60);
+      else                     snprintf(buf, sizeof(buf), "%4.2fV(%2d%%) OFFL%2luh", n3Snap.battery, pct3, agoSec3 / 3600);
     } else if (n3Snap.lastSeen == 0 && n3Snap.active) {
-      snprintf(buf, sizeof(buf), "%4.2f V | #%-4lu[NVS]", n3Snap.battery, (unsigned long)n3Snap.counter);
+      snprintf(buf, sizeof(buf), "%4.2fV (%2d%%) #%-4lu[NVS]", n3Snap.battery, pct3, (unsigned long)n3Snap.counter);
     } else {
-      snprintf(buf, sizeof(buf), "%4.2f V | #%-6lu", n3Snap.battery, (unsigned long)n3Snap.counter);
+      snprintf(buf, sizeof(buf), "%4.2fV (%2d%%) #%-5lu", n3Snap.battery, pct3, (unsigned long)n3Snap.counter);
     }
   } else {
     tft.setTextColor(COLOR_TEXT_MUTED, COLOR_CARD_BG);
-    snprintf(buf, sizeof(buf), "--.-- V | #0      ");
+    snprintf(buf, sizeof(buf), "--.-- V (--%%) #0    ");
   }
   tft.drawString(buf, 115, 264);
 
@@ -2800,8 +2820,8 @@ void processIncomingJson(const String& cleanJson, const char* source) {
 
         saveTelemetryNVS(1);
 
-        Serial.printf("[SYNC -> LCD N1] Suhu=%.1f C | Lembap=%.1f %% | Tanah=%.1f %% | Bat=%.2f V | Pkt=%lu\n",
-                      node1.temperature, node1.humidity, node1.soil_moisture, node1.battery, (unsigned long)node1.counter);
+        Serial.printf("[SYNC -> LCD N1] Suhu=%.1f C | Lembap=%.1f %% | Tanah=%.1f %% | Bat=%.2f V (%d%%) | Pkt=%lu\n",
+                      node1.temperature, node1.humidity, node1.soil_moisture, node1.battery, hitungPersenBaterai(node1.battery), (unsigned long)node1.counter);
 
       // -------------------------------------------------------------
       // 2. DATA NODE 2 (HORTIKULTURA B)
@@ -2821,8 +2841,8 @@ void processIncomingJson(const String& cleanJson, const char* source) {
 
         saveTelemetryNVS(2);
 
-        Serial.printf("[SYNC -> LCD N2] Suhu=%.1f C | Lembap=%.1f %% | Tanah=%.1f %% | Bat=%.2f V | Pkt=%lu\n",
-                      node2.temperature, node2.humidity, node2.soil_moisture, node2.battery, (unsigned long)node2.counter);
+        Serial.printf("[SYNC -> LCD N2] Suhu=%.1f C | Lembap=%.1f %% | Tanah=%.1f %% | Bat=%.2f V (%d%%) | Pkt=%lu\n",
+                      node2.temperature, node2.humidity, node2.soil_moisture, node2.battery, hitungPersenBaterai(node2.battery), (unsigned long)node2.counter);
 
       // -------------------------------------------------------------
       // 3. DATA NODE 3 (GAMBUT & KARHUTLA BMKG FDRS)
@@ -2895,9 +2915,9 @@ void processIncomingJson(const String& cleanJson, const char* source) {
 
         saveTelemetryNVS(3);
 
-        Serial.printf("[SYNC -> LCD N3] T_Gambut=%.2f C | FWI=%.2f [%s] | Bat=%.2f V | Pkt=%lu\n",
+        Serial.printf("[SYNC -> LCD N3] T_Gambut=%.2f C | FWI=%.2f [%s] | Bat=%.2f V (%d%%) | Pkt=%lu\n",
                       node3.soil_temp, node3.fwi_score, BMKG_LEVEL_STR[node3.fwi_level < 5 ? node3.fwi_level : 4],
-                      node3.battery, (unsigned long)node3.counter);
+                      node3.battery, hitungPersenBaterai(node3.battery), (unsigned long)node3.counter);
       }
 
       xSemaphoreGive(xDataMutex);
