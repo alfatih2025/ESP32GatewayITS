@@ -292,7 +292,7 @@ bool is3PhaseFertCycle = false;
 bool isKarhutlaCycle = false;
 
 unsigned long lastAutoCycleTime = 0;
-const unsigned long COOLDOWN_AGRI_MS = 15UL * 60UL * 1000UL;
+const unsigned long COOLDOWN_AGRI_MS = 3UL * 60UL * 1000UL;
 const unsigned long COOLDOWN_KARHUTLA_MS = 1UL * 60UL * 1000UL; // 1 menit jeda antar siklus darurat karhutla
 
 // =========================================================================
@@ -1538,7 +1538,7 @@ void evaluasiAktuatorOtomatis() {
   // Tanaman disiram air bersih murni untuk penyelamatan dehidrasi akut.
   // -----------------------------------------------------------------------
   if (!isnan(agriSoilMin) && (agriSoilMin > 5.0f) && (agriSoilMin <= ambangKritis)) {
-    if (now - lastAutoCycleTime >= COOLDOWN_AGRI_MS) { // Jeda 15 menit agar air meresap ke sensor sebelum siklus darurat berikutnya
+    if (now - lastAutoCycleTime >= COOLDOWN_AGRI_MS) { // Jeda 3 menit agar air meresap ke sensor sebelum siklus darurat berikutnya
       float volDarurat = hitungTargetVolumeAir(agriSoilMin, vpdAgri, 65.0f, agriTemp, agriRh);
       volDarurat = max(volDarurat, 1.2f); // Minimal 1.2 L untuk penyelamatan
 

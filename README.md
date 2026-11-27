@@ -236,7 +236,7 @@ Lahan gambut yang terancam kebakaran memiliki dua masalah sekaligus: **ancaman k
 | **Hardware & Software Interlock** | Relay 1 dan Relay 2 saling mengunci, mustahil aktif bersamaan |
 | **No-Flow Safety Cutoff** | Jika relay sudah ON 10 detik tapi sensor flow tidak mendeteksi pulsa air (< 0.03 L), relay langsung dimatikan dan alarm MQTT dikirim (`NO_WATER_FLOW`) |
 | **Safety Timeout Limit** | Irigasi maks. 3 menit, Fertigasi maks. 2 menit per sesi |
-| **Absorption Cooldown** | Jeda serap tanah: 15 menit (pertanian), 5 menit (karhutla darurat) |
+| **Absorption Cooldown** | Jeda serap tanah: 3 menit (pertanian), 5 menit (karhutla darurat) |
 
 ---
 
@@ -363,7 +363,7 @@ Koneksi WiFi dimatikan secara sengaja saat sistem berjalan. Diverifikasi bahwa:
 * **Mode Otomatis — Pertanian:** Diuji dengan menyimulasikan tanah kering di bawah threshold (Soil Moisture < 45%) agar siklus irigasi terpicu sendiri, dan menyimulasikan pH di luar rentang optimal (< 5.8 atau > 7.3) agar fertigasi nutrisi terpicu.
 * **Mode Otomatis — Karhutla Gambut:** Diuji dengan menyimulasikan skenario FWI Level ≥ 2 dan/atau suhu tanah ≥ 40°C agar siklus gabungan rewetting + amelioran penetral terpicu secara sekuensial.
 * **Waktu Tanggap:** Diukur sejak perintah dikirim dari dashboard sampai relay menyalakan perangkat dan indikator TFT berubah.
-* **Mekanisme Proteksi:** Safety timeout (maks. 3 menit irigasi, 2 menit fertigasi), no-flow cutoff (alarm jika tidak ada air setelah 10 detik), cooldown jeda peresapan (15 menit pertanian, 5 menit karhutla), dan hardware interlock antar relay diverifikasi.
+* **Mekanisme Proteksi:** Safety timeout (maks. 3 menit irigasi, 2 menit fertigasi), no-flow cutoff (alarm jika tidak ada air setelah 10 detik), cooldown jeda peresapan (3 menit pertanian, 5 menit karhutla), dan hardware interlock antar relay diverifikasi.
 
 ---
 
