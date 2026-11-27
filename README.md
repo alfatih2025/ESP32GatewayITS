@@ -456,6 +456,42 @@ lib_deps =
    [WiFi] Connected! IP: 192.168.x.x
    [MQTT] Connecting to HiveMQ... connected!
    ```
+6. Untuk menguji keputusan irigasi dan waterflow secara berurutan tanpa mengaktifkan relay fisik, ketik perintah di Serial Monitor dan kirim dengan newline:
+   ```text
+   SIM start=auto soil=30 critical=35 upper=75 temp=28 rh=65 rain=0 cooldown=ready
+   SIM flow_pulses=450 flow_seconds=10
+   SIM flow_pulses=1125 flow_seconds=25
+   ```
+   Perintah pertama mengevaluasi sensor dan memulai simulasi otomatis jika syarat irigasi terpenuhi; perhatikan target liter yang dicetak. Setiap perintah `flow_pulses` adalah **pulsa tambahan sejak input flow sebelumnya**, bukan total kumulatif. Dengan kalibrasi 450 pulsa/liter, dua perintah flow di atas menambahkan total 3,5 L; sesuaikan dengan target yang tampil.
+   Parameter keputusan opsional: `soil2`, `critical`, `upper`, `temp`, `rh`, `rain`, `score_on`/`score_off`, `temp_high`/`hum_low`, `cycle=on|off`, dan `cooldown=ready|wait`. Threshold yang tidak diberikan memakai konfigurasi aktif. Cek sesi dengan `SIM status`, atau batalkan/reset dengan `SIM reset`.
+   Untuk uji relay fertigasi dan penutupan berdasarkan target dosis:
+   ```text
+   SIM start=fertigasi target=1.0
+   SIM flow_pulses=225 flow_seconds=10
+   SIM flow_pulses=225 flow_seconds=10
+   ```
+   Untuk menguji siklus 3 tahap (pre-wet, dosis pupuk, lalu bilas), gunakan:
+   ```text
+   SIM start=fertigasi target=1.0 prewet=0.5 flush=0.3
+   SIM flow_pulses=225 flow_seconds=10
+   SIM flow_pulses=450 flow_seconds=10
+   SIM flow_pulses=135 flow_seconds=10
+   ```
+   Pada fertigasi, `target` wajib dalam liter; `prewet` dan `flush` opsional. Jika `flush` tidak diberikan, relay fertigasi simulasi OFF setelah target dosis tercapai. Mode `start=fertigasi` menguji FSM dosis secara langsung dan **tidak** menguji syarat kelayakan otomatis fertigasi (jadwal biologis, interval hari, pH, cuaca). `start=auto` menguji keputusan irigasi berbasis tanah/cuaca.
+   `SIM flow_pulses=0 flow_seconds=36` menguji `NO_FLOW_DETECTED` bila suatu tahap sedang aktif. Semua tahapan dan status relay hanya simulasi; tidak menulis ke pin relay, mengubah data sensor/konfigurasi, atau mengirim MQTT.
+7. Untuk uji integrasi nyata dari Serial Monitor (data masuk MQTT/web dan kontrol memakai FSM/relay fisik), sistem harus tersambung MQTT dan disetel **OTOMATIS** dari dashboard. Perintah ini dapat benar-benar mengaktifkan pompa/katup: lakukan hanya di bangku uji aman, dengan area basah dan jalur air dikendalikan serta pengawasan langsung.
+   ```text
+   SIM live=on confirm=ARM
+   SIM node=1 soil=30 temp=28 rh=65
+   SIM node=2 soil=34 temp=29 rh=60
+   SIM ph=6.5
+   SIM rain=0
+   SIM run
+   SIM flow_pulses=450 flow_seconds=10
+   SIM status
+   ```
+   `SIM node=1|2` menerima `soil`, `temp`, `rh`, `battery`; `SIM node=3` menerima `soil_temp`, `ambient_temp`, `ambient_hum`, `battery`. Nilai node dan pH dipublikasikan ke MQTT/web dengan penanda `simulation=true` dan tidak disimpan ke NVS. `SIM run` meminta satu evaluasi otomatis nyata setelah data dimasukkan; setelahnya FSM berjalan normal. Kirim `flow_pulses` sebagai tambahan pulsa uji (450 pulsa = 1 L); selama live test, pulsa sensor fisik diabaikan agar tidak tercampur dengan input serial. pH yang diinput dipakai oleh logika fertigasi.
+   Arm hanya berlaku 10 menit, memerlukan mode OTOMATIS serta koneksi MQTT, dan menahan evaluasi jadwal/otomatis berkala sampai `SIM run` dikirim. FSM aktif, timeout keselamatan, dan waterflow tetap berjalan. `SIM live=off` atau `SIM reset` mematikan aktuator aktif dan melepas arm; jika koneksi MQTT putus atau waktu arm habis, sistem juga disarm dan mematikan aktuator. Data sensor simulasi ditandai stale saat disarm. Untuk benar-benar menguji syarat fertigasi otomatis, waktu NTP, interval hari, pH, cuaca, dan semua interlock tetap harus memenuhi logika firmware.
 
 ---
 

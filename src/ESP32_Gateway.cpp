@@ -28,6 +28,7 @@ void startIrigasiTerjadwal(int durasiDetik);
 void evaluasiJadwalPenyiraman();
 void startFertigasiSiklus3Tahap(float volNutrisi, float customPreWet = 0.0f, float customPostFlush = 0.0f, bool karhutla = false);
 void recoverTftDisplay();
+void processIncomingJson(const String& cleanJson, const char* source);
 
 // =====================================================
 // WIFI CONFIG (Dinamis dari NVS Flash, default dari secret.h)
@@ -244,6 +245,7 @@ volatile uint32_t sessionFlowPulses = 0;
 float flowRateLpm = 0.0f;
 float totalWaterLiters = 0.0f;
 float sessionWaterLiters = 0.0f;
+volatile bool liveSimulationArmed = false;
 uint32_t lastSnapPulses = 0;
 unsigned long lastFlowRateCalcTime = 0;
 
@@ -260,6 +262,7 @@ float lastSavedWater = 0.0f;
 volatile unsigned long lastFlowPulseMicros = 0;
 
 void IRAM_ATTR flowSensorISR() {
+  if (liveSimulationArmed) return;
   unsigned long nowUs = micros();
   // Filter glitch / noise induktif: minimum interval 1500 us (maks ~660 Hz / ~88 L/min)
   // Mencegah freeze Core 1 dan korupsi bus SPI TFT saat relay/motor pompa bekerja
@@ -292,7 +295,7 @@ bool is3PhaseFertCycle = false;
 bool isKarhutlaCycle = false;
 
 unsigned long lastAutoCycleTime = 0;
-const unsigned long COOLDOWN_AGRI_MS = 15UL * 60UL * 1000UL;
+const unsigned long COOLDOWN_AGRI_MS = 5UL * 60UL * 1000UL;
 const unsigned long COOLDOWN_KARHUTLA_MS = 1UL * 60UL * 1000UL; // 1 menit jeda antar siklus darurat karhutla
 
 // =========================================================================
@@ -525,7 +528,7 @@ uint8_t tentukanFireLevelGateway(float fwi, float soilTemp) {
 // =====================================================
 // PUBLISH KE MQTT BROKER
 // =====================================================
-void publishNode3Mqtt(const Node3Data& n3) {
+void publishNode3Mqtt(const Node3Data& n3, bool simulated = false, bool queueWhenOffline = true) {
   const String topicNode = "sproutai/sensor/node/3";
   const String topicData = "sproutai/sensor/data";
   const String topicFWI  = "sproutai/karhutla/fwi";
@@ -538,6 +541,7 @@ void publishNode3Mqtt(const Node3Data& n3) {
   snprintf(json, sizeof(json),
     "{"
     "\"node_id\":3,"
+    "\"simulation\":%s,"
     "\"soil_temp\":%.2f,"        // Suhu Tanah Gambut DS18B20
     "\"battery\":%.2f,"          // Voltase Baterai Node 3
     "\"battery_pct\":%d,"        // Persentase Baterai Node 3 (Li-Po 1S)
@@ -553,6 +557,7 @@ void publishNode3Mqtt(const Node3Data& n3) {
     "\"fwi_status\":\"%s\","
     "\"counter\":%lu"
     "}",
+    simulated ? "true" : "false",
     isnan(n3.soil_temp)   ? 0.0f : n3.soil_temp,
     isnan(n3.battery)     ? 0.0f : n3.battery,
     hitungPersenBaterai(n3.battery),
@@ -584,32 +589,33 @@ void publishNode3Mqtt(const Node3Data& n3) {
         (n3.fwi_level >= 4 || n3.soil_temp >= 45.0f) ? "true" : "false");
       safeMqttPublish(topicAlrt.c_str(), alert, false);
     }
-  } else {
+  } else if (queueWhenOffline) {
     bufferAdd(topicNode, String(json));
     bufferAdd(topicFWI,  String(json));
   }
 }
 
-void publishPhMqtt(float ph) {
+void publishPhMqtt(float ph, bool simulated = false, bool queueWhenOffline = true) {
   if (isnan(ph)) return;
-  char json[96];
-  snprintf(json, sizeof(json), "{\"node_id\":0,\"ph\":%.2f}", ph);
+  char json[128];
+  snprintf(json, sizeof(json), "{\"node_id\":0,\"ph\":%.2f,\"simulation\":%s}",
+           ph, simulated ? "true" : "false");
   if (mqttClient.connected()) {
     safeMqttPublish("sproutai/sensor/ph", json, false);
     safeMqttPublish("sproutai/sensor/data", json, false);
-  } else {
+  } else if (queueWhenOffline) {
     bufferAdd("sproutai/sensor/ph", String(json));
   }
 }
 
-void processData(int nodeId, const String& jsonPayload) {
+void processData(int nodeId, const String& jsonPayload, bool queueWhenOffline = true) {
   String topic = "sproutai/sensor/node/" + String(nodeId);
   String topicData = "sproutai/sensor/data";
 
   if (mqttClient.connected()) {
     safeMqttPublish(topic.c_str(), jsonPayload.c_str(), true); // Retained agar web langsung tampilkan data terakhir
     safeMqttPublish(topicData.c_str(), jsonPayload.c_str(), false);
-  } else {
+  } else if (queueWhenOffline) {
     bufferAdd(topic, jsonPayload);
     bufferAdd(topicData, jsonPayload);
   }
@@ -622,21 +628,22 @@ void publishActuatorMqtt() {
                             (actuatorState == STATE_FERTIGASI_ACTIVE) ? "FERTIGASI" :
                             (actuatorState == STATE_POST_FLUSH_ACTIVE) ? "POST_FLUSH" : "IDLE";
 
-  char flowJson[180];
+  char flowJson[220];
   snprintf(flowJson, sizeof(flowJson),
-    "{\"flow_rate\":%.2f,\"session_liters\":%.2f,\"total_liters\":%.2f,\"active_valve\":\"%s\"}",
-    flowRateLpm, sessionWaterLiters, totalWaterLiters, activeValve);
+    "{\"flow_rate\":%.2f,\"session_liters\":%.2f,\"total_liters\":%.2f,\"active_valve\":\"%s\",\"simulation\":%s}",
+    flowRateLpm, sessionWaterLiters, totalWaterLiters, activeValve,
+    liveSimulationArmed ? "true" : "false");
   safeMqttPublish("sproutai/sensor/flow", flowJson, false);
 
   bool isAuto = modeSistem.equalsIgnoreCase("OTOMATIS") || modeSistem.equalsIgnoreCase("AUTO");
   bool isOnline = (WiFi.status() == WL_CONNECTED);
 
-  char actJson[420];
+  char actJson[460];
   snprintf(actJson, sizeof(actJson),
     "{\"irigasi\":%s,\"fertigasi\":%s,\"pompa\":%s,\"mode\":\"%s\","
     "\"lampu_sistem\":true,\"lampu_online\":%s,"
     "\"target_liters\":%.2f,\"current_liters\":%.2f,\"total_liters\":%.2f,\"karhutla_mode\":%s,"
-    "\"siklus_3tahap\":%s,\"active_valve\":\"%s\"}",
+    "\"siklus_3tahap\":%s,\"active_valve\":\"%s\",\"simulation\":%s}",
     statusIrigasi ? "true" : "false",
     statusFertigasi ? "true" : "false",
     statusPompa ? "true" : "false",
@@ -649,7 +656,8 @@ void publishActuatorMqtt() {
     totalWaterLiters,
     isKarhutlaCycle ? "true" : "false",
     is3PhaseFertCycle ? "true" : "false",
-    activeValve);
+    activeValve,
+    liveSimulationArmed ? "true" : "false");
   // Retained = true agar broker HiveMQ menyimpan status terakhir untuk browser baru/refresh
   safeMqttPublish("sproutai/actuator/status", actJson, true);
   safeMqttPublish("sproutai/pompa/status", statusPompa ? "ON" : "OFF", true);
@@ -712,6 +720,7 @@ void initActuatorHardware() {
 }
 
 void updateFlowSensorMetrics() {
+  if (liveSimulationArmed) return;
   unsigned long now = millis();
   if (now - lastFlowRateCalcTime >= 1000UL) {
     unsigned long dt = now - lastFlowRateCalcTime;
@@ -1028,10 +1037,12 @@ void processActuatorFSM() {
 
         struct tm ti;
         if (getLocalTime(&ti, 20)) {
-          lastFertigasiDay = ti.tm_mday;
-          lastFertigasiMonth = ti.tm_mon + 1;
-          lastFertigasiYear = ti.tm_year + 1900;
-          saveAgriSettingsNVS();
+          if (!liveSimulationArmed) {
+            lastFertigasiDay = ti.tm_mday;
+            lastFertigasiMonth = ti.tm_mon + 1;
+            lastFertigasiYear = ti.tm_year + 1900;
+            saveAgriSettingsNVS();
+          }
         }
 
         Serial.println(F("[FSM] >>> SIKLUS 3-TAHAP FERTIGASI SUKSES LENGKAP & PIPA DIBILAS BERSIH! <<<"));
@@ -1275,19 +1286,9 @@ void saveAgriSettingsNVS() {
 // PENGGABUNGAN DATA 2 NODE HORTIKULTURA (NODE 1 & NODE 2)
 // Menangani Deep Sleep, Keandalan Sensor, dan Disparitas Kelembapan Lahan
 // =========================================================================
-void hitungMetrikDuaNode(float &outSoilRep, float &outSoilMin, float &outTemp, float &outRh) {
-  unsigned long now = millis();
-  // Toleransi 180 detik mencakup siklus Deep Sleep Node 1 & Node 2 (5-30s + transmisi)
-  bool n1Valid = (node1.active && (node1.lastSeen > 0) && (now - node1.lastSeen < 180000UL) && !isnan(node1.soil_moisture));
-  bool n2Valid = (node2.active && (node2.lastSeen > 0) && (now - node2.lastSeen < 180000UL) && !isnan(node2.soil_moisture));
-
-  float s1 = n1Valid ? node1.soil_moisture : NAN;
-  float s2 = n2Valid ? node2.soil_moisture : NAN;
-
-  // 1. Kelembapan Tanah Terendah & Representatif
+void hitungMetrikTanah(float s1, float s2, float &outSoilRep, float &outSoilMin) {
   if (!isnan(s1) && !isnan(s2)) {
     outSoilMin = min(s1, s2);
-    // Jika ada ketimpangan kelembapan antar dua titik (> 8%), bobotkan ke titik terkering (70% min + 30% avg)
     float selisih = fabs(s1 - s2);
     if (selisih > 8.0f) {
       outSoilRep = (outSoilMin * 0.7f) + (((s1 + s2) / 2.0f) * 0.3f);
@@ -1304,6 +1305,19 @@ void hitungMetrikDuaNode(float &outSoilRep, float &outSoilMin, float &outTemp, f
     outSoilMin = 50.0f;
     outSoilRep = 50.0f;
   }
+}
+
+void hitungMetrikDuaNode(float &outSoilRep, float &outSoilMin, float &outTemp, float &outRh) {
+  unsigned long now = millis();
+  // Toleransi 180 detik mencakup siklus Deep Sleep Node 1 & Node 2 (5-30s + transmisi)
+  bool n1Valid = (node1.active && (node1.lastSeen > 0) && (now - node1.lastSeen < 180000UL) && !isnan(node1.soil_moisture));
+  bool n2Valid = (node2.active && (node2.lastSeen > 0) && (now - node2.lastSeen < 180000UL) && !isnan(node2.soil_moisture));
+
+  float s1 = n1Valid ? node1.soil_moisture : NAN;
+  float s2 = n2Valid ? node2.soil_moisture : NAN;
+
+  // 1. Kelembapan tanah terendah & representatif
+  hitungMetrikTanah(s1, s2, outSoilRep, outSoilMin);
 
   // 2. Mikroklimat Gabungan Suhu & Kelembapan Udara untuk VPD
   float t1 = (!isnan(node1.temperature) && node1.temperature > 0.0f) ? node1.temperature : NAN;
@@ -1324,53 +1338,82 @@ void hitungMetrikDuaNode(float &outSoilRep, float &outSoilMin, float &outTemp, f
 // =========================================================================
 // RUMUS PERHITUNGAN SKOR IRIGASI LENGKAP (SESUAI FORMULA ARDUINO CODE NEXA)
 // =========================================================================
-void hitungSkorIrigasiHortikultura(float tanah, float suhu, float rh, float p_hujan) {
-  if (isnan(tanah) || isnan(suhu) || isnan(rh) || suhu <= 0.0f || rh <= 0.0f) return;
+struct IrrigationScoreResult {
+  bool valid = false;
+  float vpd = 0.0f;
+  float soil = 0.0f;
+  float vpdScore = 0.0f;
+  float interaction = 0.0f;
+  float rain = 0.0f;
+  float total = 0.0f;
+  bool cycleActive = false;
+};
+
+IrrigationScoreResult calculateIrrigationScore(
+    float tanah, float suhu, float rh, float p_hujan,
+    float batasAtas, float batasKritis, float skorAktif, float skorBawah,
+    bool previousCycleActive) {
+  IrrigationScoreResult result;
+  result.cycleActive = previousCycleActive;
+  if (isnan(tanah) || isnan(suhu) || isnan(rh) || suhu <= 0.0f || rh <= 0.0f) return result;
 
   // 1. Perhitungan VPD (Tetens Equation, kPa)
   float svp = 0.6108f * expf((17.27f * suhu) / (suhu + 237.3f));
-  vpdAgri = svp * (1.0f - (rh / 100.0f));
-  vpdAgri = constrain(vpdAgri, 0.4f, 2.0f);
+  result.vpd = constrain(svp * (1.0f - (rh / 100.0f)), 0.4f, 2.0f);
 
   // 2. Skor VPD: 0 - 30 poin (Makin tinggi VPD = udara kering & panas = tuntutan air naik)
-  skorVpd = ((vpdAgri - 0.4f) * 30.0f) / (2.0f - 0.4f);
-  skorVpd = constrain(skorVpd, 0.0f, 30.0f);
+  result.vpdScore = constrain(((result.vpd - 0.4f) * 30.0f) / (2.0f - 0.4f), 0.0f, 30.0f);
 
   // 3. Skor Tanah: 0 - 50 poin (Linear defisit dari ambangAtas ke ambangKritis)
-  float batasAtas = ambangAtas;
-  float batasKritis = ambangKritis;
   if (batasAtas <= batasKritis) batasAtas = batasKritis + 1.0f;
 
-  skorTanah = ((batasAtas - tanah) * 50.0f) / (batasAtas - batasKritis);
-  skorTanah = constrain(skorTanah, 0.0f, 50.0f);
+  result.soil = constrain(((batasAtas - tanah) * 50.0f) / (batasAtas - batasKritis), 0.0f, 50.0f);
 
   // 4. Skor Peluang Hujan BMKG: 0 - 40 poin (Pengurang skor untuk hemat air)
   float safeRain = constrain(p_hujan, 0.0f, 100.0f);
-  skorHujan = (safeRain / 100.0f) * 40.0f;
-  skorHujan = constrain(skorHujan, 0.0f, 40.0f);
+  result.rain = constrain((safeRain / 100.0f) * 40.0f, 0.0f, 40.0f);
 
   // 5. Skor Interaksi (Maks 20 Poin agar Total Skor Maksimal Pas Tepat 100 Poin)
   // Ketika skorTanah=50 dan skorVpd=30: (50 * 30) / 75.0 = 20.0 poin
-  skorInteraksi = ((skorTanah * skorVpd) / 75.0f);
-  skorInteraksi = constrain(skorInteraksi, 0.0f, 20.0f);
+  result.interaction = constrain((result.soil * result.vpdScore) / 75.0f, 0.0f, 20.0f);
 
   // 6. Skor Total Akhir (Rentang Standar Presisi 0.0 s/d 100.0 Poin: 50 + 30 + 20 - 0 = 100)
-  skorTotal = constrain(skorTanah + skorVpd + skorInteraksi - skorHujan, 0.0f, 100.0f);
+  result.total = constrain(result.soil + result.vpdScore + result.interaction - result.rain, 0.0f, 100.0f);
 
   // 7. Update Status Siklus Irigasi (Histeresis)
-  if (skorTotal >= ambangSkorAktif) {
-    siklusIrigasiAktif = true;
-  } else if (skorTotal <= ambangSkorBawah) {
-    siklusIrigasiAktif = false;
+  if (result.total >= skorAktif) {
+    result.cycleActive = true;
+  } else if (result.total <= skorBawah) {
+    result.cycleActive = false;
   }
+
+  result.valid = true;
+  return result;
+}
+
+void hitungSkorIrigasiHortikultura(float tanah, float suhu, float rh, float p_hujan) {
+  IrrigationScoreResult result = calculateIrrigationScore(
+    tanah, suhu, rh, p_hujan, ambangAtas, ambangKritis,
+    ambangSkorAktif, ambangSkorBawah, siklusIrigasiAktif);
+  if (!result.valid) return;
+
+  vpdAgri = result.vpd;
+  skorTanah = result.soil;
+  skorVpd = result.vpdScore;
+  skorInteraksi = result.interaction;
+  skorHujan = result.rain;
+  skorTotal = result.total;
+  siklusIrigasiAktif = result.cycleActive;
 }
 
 // =========================================================================
 // KALKULASI TARGET VOLUME AIR BERBASIS WATERFLOW (CLOSED-LOOP PRESISI)
 // Efisiensi air maksimal: durasi penyiraman dikendalikan oleh volume air riil
 // =========================================================================
-float hitungTargetVolumeAir(float tanah, float vpd, float skor, float suhu = NAN, float rh = NAN) {
-  float deltaSM = max(0.0f, ambangAtas - tanah);
+float calculateTargetVolumeAir(
+    float tanah, float vpd, float skor, float suhu, float rh,
+    float batasAtas, float batasTempHigh, float batasHumLow, bool vegetative) {
+  float deltaSM = max(0.0f, batasAtas - tanah);
   if (deltaSM <= 0.0f) return 0.0f;
 
   // Faktor evaporatif mikro-klimat dari VPD (0.8 - 1.6)
@@ -1379,16 +1422,16 @@ float hitungTargetVolumeAir(float tanah, float vpd, float skor, float suhu = NAN
   // Kompensasi Stres Mikro-Klimat:
   // Jika suhu aktual melebihi ambang batas atas suhu atau RH di bawah ambang batas bawah,
   // laju transpirasi tanaman dan penguapan tanah sangat tinggi, naikkan kompensasi volume air
-  if (!isnan(suhu) && suhu > ambangTempHigh) {
+  if (!isnan(suhu) && suhu > batasTempHigh) {
     evapFactor += 0.15f;
   }
-  if (!isnan(rh) && rh < ambangHumLow) {
+  if (!isnan(rh) && rh < batasHumLow) {
     evapFactor += 0.10f;
   }
   evapFactor = constrain(evapFactor, 0.8f, 1.8f);
 
   // Faktor fase tanaman (Vegetatif = 1.0x, Generatif = 0.85x)
-  float faseFactor = faseVegetatif ? 1.0f : 0.85f;
+  float faseFactor = vegetative ? 1.0f : 0.85f;
 
   // Skala kebutuhan air berbasis skor (skor 30 -> 0.6x, skor 60 -> 1.2x)
   float skorFactor = constrain(skor / 50.0f, 0.6f, 1.5f);
@@ -1396,6 +1439,12 @@ float hitungTargetVolumeAir(float tanah, float vpd, float skor, float suhu = NAN
   // Target volume air per siklus: 0.4 s/d 3.5 Liter
   float volumeTarget = (deltaSM / 30.0f) * 1.5f * evapFactor * faseFactor * skorFactor;
   return constrain(volumeTarget, 0.4f, 3.5f);
+}
+
+float hitungTargetVolumeAir(float tanah, float vpd, float skor, float suhu = NAN, float rh = NAN) {
+  return calculateTargetVolumeAir(
+    tanah, vpd, skor, suhu, rh,
+    ambangAtas, ambangTempHigh, ambangHumLow, faseVegetatif);
 }
 
 float hitungTargetFertigasiPertanian(float ph) {
@@ -1411,7 +1460,7 @@ float hitungTargetFertigasiPertanian(float ph) {
 void publishIrrigationScoreMqtt() {
   if (!mqttClient.connected()) return;
 
-  char scoreJson[440];
+  char scoreJson[480];
   snprintf(scoreJson, sizeof(scoreJson),
     "{"
     "\"skor_tanah\":%.1f,"
@@ -1431,7 +1480,8 @@ void publishIrrigationScoreMqtt() {
     "\"jadwal\":\"%02d:%02d\","
     "\"jadwal_aktif\":%s,"
     "\"fert_interval\":%d,"
-    "\"last_fert_day\":%d"
+    "\"last_fert_day\":%d,"
+    "\"simulation\":%s"
     "}",
     skorTanah, skorVpd, skorInteraksi, skorHujan, skorTotal,
     vpdAgri,
@@ -1447,10 +1497,34 @@ void publishIrrigationScoreMqtt() {
     jadwalJam, jadwalMenit,
     jadwalPenyiramanAktif ? "true" : "false",
     intervalHariFertigasi,
-    lastFertigasiDay
+    lastFertigasiDay,
+    liveSimulationArmed ? "true" : "false"
   );
 
   safeMqttPublish("sproutai/irrigation/score", scoreJson, false);
+}
+
+enum IrrigationDecision {
+  IRRIGATION_EMERGENCY,
+  IRRIGATION_SOIL_SATURATED,
+  IRRIGATION_HEAVY_RAIN,
+  IRRIGATION_WAIT_COOLDOWN,
+  IRRIGATION_SCORE_TRIGGER,
+  IRRIGATION_SCORE_BELOW_TRIGGER
+};
+
+IrrigationDecision evaluasiKeputusanIrigasi(
+    float soilRep, float soilMin, float rainChance, float soilCritical,
+    float soilUpper, float score, float scoreActive, bool cycleActive,
+    bool cooldownReady) {
+  if (!isnan(soilMin) && soilMin > 5.0f && soilMin <= soilCritical && cooldownReady) {
+    return IRRIGATION_EMERGENCY;
+  }
+  if (!isnan(soilRep) && soilRep >= soilUpper) return IRRIGATION_SOIL_SATURATED;
+  if (rainChance >= 85.0f) return IRRIGATION_HEAVY_RAIN;
+  if (!cooldownReady) return IRRIGATION_WAIT_COOLDOWN;
+  if (cycleActive || score >= scoreActive) return IRRIGATION_SCORE_TRIGGER;
+  return IRRIGATION_SCORE_BELOW_TRIGGER;
 }
 
 // =========================================================================
@@ -1531,29 +1605,31 @@ void evaluasiAktuatorOtomatis() {
 
   // Jalankan rumus scoring irigasi (VPD, Tanah, Interaksi, Peluang Hujan)
   hitungSkorIrigasiHortikultura(agriSoilRep, agriTemp, agriRh, peluangHujan);
+  IrrigationDecision agriDecision = evaluasiKeputusanIrigasi(
+    agriSoilRep, agriSoilMin, peluangHujan, ambangKritis, ambangAtas,
+    skorTotal, ambangSkorAktif, siklusIrigasiAktif,
+    now - lastAutoCycleTime >= COOLDOWN_AGRI_MS);
 
   // -----------------------------------------------------------------------
   // PRIORITAS 2: PROTEKSI DARURAT KEKERINGAN KRITIS (EMERGENCY OVERRIDE AIR BERSIH)
   // Jika salah satu titik tanah jatuh <= batas kritis, bypass jadwal jam!
   // Tanaman disiram air bersih murni untuk penyelamatan dehidrasi akut.
   // -----------------------------------------------------------------------
-  if (!isnan(agriSoilMin) && (agriSoilMin > 5.0f) && (agriSoilMin <= ambangKritis)) {
-    if (now - lastAutoCycleTime >= COOLDOWN_AGRI_MS) { // Jeda 15 menit agar air meresap ke sensor sebelum siklus darurat berikutnya
-      float volDarurat = hitungTargetVolumeAir(agriSoilMin, vpdAgri, 65.0f, agriTemp, agriRh);
-      volDarurat = max(volDarurat, 1.2f); // Minimal 1.2 L untuk penyelamatan
+  if (agriDecision == IRRIGATION_EMERGENCY) {
+    float volDarurat = hitungTargetVolumeAir(agriSoilMin, vpdAgri, 65.0f, agriTemp, agriRh);
+    volDarurat = max(volDarurat, 1.2f); // Minimal 1.2 L untuk penyelamatan
 
-      Serial.printf("[AUTO EMERGENCY] Tanah kritis (%.1f%% <= %.1f%%)! Siram darurat air murni %.2f L\n",
-                    agriSoilMin, ambangKritis, volDarurat);
-      startIrigasi(volDarurat, false, 0.0f, false);
-      return;
-    }
+    Serial.printf("[AUTO EMERGENCY] Tanah kritis (%.1f%% <= %.1f%%)! Siram darurat air murni %.2f L\n",
+                  agriSoilMin, ambangKritis, volDarurat);
+    startIrigasi(volDarurat, false, 0.0f, false);
+    return;
   }
 
   // -----------------------------------------------------------------------
   // PRIORITAS 3: PROTEKSI KEJENUHAN AIR & BADAI HUJAN DERAS
   // Jika tanah sudah jenuh (>= ambangAtas) atau peluang hujan >= 85%, batalkan!
   // -----------------------------------------------------------------------
-  if ((!isnan(agriSoilRep) && (agriSoilRep >= ambangAtas)) || (peluangHujan >= 85.0f)) {
+  if (agriDecision == IRRIGATION_SOIL_SATURATED || agriDecision == IRRIGATION_HEAVY_RAIN) {
     return; // Air sudah mencukupi atau akan hujan deras
   }
 
@@ -1605,10 +1681,7 @@ void evaluasiAktuatorOtomatis() {
   bool dalamJendelaBiologis = timeValid ? isJendelaBiologis(curH, curM) : false;
   // 4C. EKSEKUSI CERDAS: FERTIGASI SIKLUS 3-TAHAP vs IRIGASI AIR BIASA (RESPON SENSORIK)
   // Beraksi jika cooldown tercapai DAN (siklus histeresis aktif ATAU skor total >= ambang aktif 55/60)
-  bool waktuAksiTiba = false;
-  if ((now - lastAutoCycleTime >= COOLDOWN_AGRI_MS) && (siklusIrigasiAktif || (skorTotal >= ambangSkorAktif))) {
-    waktuAksiTiba = true;
-  }
+  bool waktuAksiTiba = (agriDecision == IRRIGATION_SCORE_TRIGGER);
 
   if (waktuAksiTiba) {
     // Kondisi khusus tanah gambut masam (Node 3 online & pH < 4.8):
@@ -2828,11 +2901,796 @@ void loadTelemetryNVS() {
 static String serial2Buffer = "";
 static String serialUsbBuffer = "";
 
+enum SimulatedActuatorState {
+  SIM_ACTUATOR_IDLE,
+  SIM_IRRIGATION_ACTIVE,
+  SIM_FERTIGATION_ACTIVE,
+  SIM_PREWET_ACTIVE,
+  SIM_POST_FLUSH_ACTIVE
+};
+
+static SimulatedActuatorState simulatedActuatorState = SIM_ACTUATOR_IDLE;
+static float simulatedStageTargetLiters = 0.0f;
+static float simulatedFertigationTargetLiters = 0.0f;
+static float simulatedFlushTargetLiters = 0.0f;
+static float simulatedStageLiters = 0.0f;
+static float simulatedStageElapsedSeconds = 0.0f;
+static uint32_t simulatedStagePulses = 0;
+static String simulatedLastResult = "BELUM ADA SIMULASI";
+static unsigned long liveSimulationExpiresAt = 0;
+static float liveSimulationSavedPh = NAN;
+static float liveSimulationSavedSessionLiters = 0.0f;
+static float liveSimulationSavedFlowRate = 0.0f;
+static uint32_t liveSimulationSavedSessionPulses = 0;
+static unsigned long liveSimulationNode1Seen = 0;
+static unsigned long liveSimulationNode2Seen = 0;
+static unsigned long liveSimulationNode3Seen = 0;
+
+bool parseSimulationNumber(const String &text, float &value) {
+  const char *raw = text.c_str();
+  char *end = nullptr;
+  value = strtof(raw, &end);
+  return end != raw && *end == '\0' && isfinite(value);
+}
+
+void disableLiveSimulation(const char *reason) {
+  if (!liveSimulationArmed) return;
+
+  if (actuatorState != STATE_IDLE || statusIrigasi || statusFertigasi || statusPompa) {
+    stopAllActuators(reason);
+  }
+
+  liveSimulationArmed = false;
+  liveSimulationExpiresAt = 0;
+  if (xDataMutex != NULL && xSemaphoreTake(xDataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (liveSimulationNode1Seen > 0 && node1.lastSeen == liveSimulationNode1Seen) node1.lastSeen = 0;
+    if (liveSimulationNode2Seen > 0 && node2.lastSeen == liveSimulationNode2Seen) node2.lastSeen = 0;
+    if (liveSimulationNode3Seen > 0 && node3.lastSeen == liveSimulationNode3Seen) node3.lastSeen = 0;
+    gatewayPh = liveSimulationSavedPh;
+    xSemaphoreGive(xDataMutex);
+  }
+
+  noInterrupts();
+  sessionFlowPulses = liveSimulationSavedSessionPulses;
+  interrupts();
+  sessionWaterLiters = liveSimulationSavedSessionLiters;
+  flowRateLpm = liveSimulationSavedFlowRate;
+  lastSavedPh = gatewayPh;
+  lastPhReadTime = millis();
+
+  Serial.printf("[SIM LIVE] DISARMED (%s). Nilai pH/flow dipulihkan; data sensor uji ditandai stale.\n", reason);
+  if (!isnan(gatewayPh)) publishPhMqtt(gatewayPh);
+  publishActuatorMqtt();
+}
+
+bool handleLiveSimulationCommand(String args) {
+  args.trim();
+
+  if (args.equalsIgnoreCase("RUN")) {
+    if (!liveSimulationArmed) {
+      Serial.println(F("[SIM LIVE] Belum di-arm. Gunakan SIM live=on confirm=ARM."));
+      return true;
+    }
+    if ((int32_t)(millis() - liveSimulationExpiresAt) >= 0 || !mqttClient.connected()) {
+      disableLiveSimulation("ARM_EXPIRED_OR_MQTT_LOST");
+      Serial.println(F("[SIM LIVE] Evaluasi dibatalkan karena arm kedaluwarsa atau MQTT terputus."));
+      return true;
+    }
+    if (!modeSistem.equalsIgnoreCase("OTOMATIS")) {
+      Serial.println(F("[SIM LIVE] Evaluasi dibatalkan: sistem tidak dalam mode OTOMATIS."));
+      return true;
+    }
+    evaluasiAktuatorOtomatis();
+    publishIrrigationScoreMqtt();
+    publishActuatorMqtt();
+    Serial.printf("[SIM LIVE] Evaluasi nyata selesai. Irigasi=%s, Fertigasi=%s, Pompa=%s.\n",
+                  statusIrigasi ? "ON" : "OFF",
+                  statusFertigasi ? "ON" : "OFF",
+                  statusPompa ? "ON" : "OFF");
+    return true;
+  }
+
+  bool liveOnRequested = false;
+  bool liveOffRequested = false;
+  bool confirmed = false;
+  bool nodeProvided = false;
+  bool phProvided = false;
+  bool rainProvided = false;
+  bool flowProvided = false;
+  bool flowSecondsProvided = false;
+  int nodeId = 0;
+  float phValue = NAN;
+  float rainValue = NAN;
+  float flowSeconds = 1.0f;
+  float flowPulsesValue = 0.0f;
+  bool sensorFieldProvided = false;
+  JsonDocument sensorDoc;
+
+  int position = 0;
+  while (position < args.length()) {
+    while (position < args.length() && args.charAt(position) == ' ') position++;
+    if (position >= args.length()) break;
+    int tokenEnd = args.indexOf(' ', position);
+    if (tokenEnd < 0) tokenEnd = args.length();
+    String token = args.substring(position, tokenEnd);
+    int equalsAt = token.indexOf('=');
+    if (equalsAt <= 0 || equalsAt == (int)token.length() - 1) {
+      Serial.printf("[SIM LIVE] Parameter tidak valid: %s\n", token.c_str());
+      return true;
+    }
+
+    String key = token.substring(0, equalsAt);
+    String rawValue = token.substring(equalsAt + 1);
+    float value = 0.0f;
+    if (key.equalsIgnoreCase("live")) {
+      if (rawValue.equalsIgnoreCase("on")) liveOnRequested = true;
+      else if (rawValue.equalsIgnoreCase("off")) liveOffRequested = true;
+      else {
+        Serial.println(F("[SIM LIVE] live harus on atau off."));
+        return true;
+      }
+    } else if (key.equalsIgnoreCase("confirm")) {
+      confirmed = rawValue.equalsIgnoreCase("ARM");
+    } else if (key.equalsIgnoreCase("node")) {
+      if (!parseSimulationNumber(rawValue, value) || floorf(value) != value || value < 1 || value > 3) {
+        Serial.println(F("[SIM LIVE] node harus 1, 2, atau 3."));
+        return true;
+      }
+      nodeId = (int)value;
+      nodeProvided = true;
+    } else if (key.equalsIgnoreCase("ph")) {
+      if (!parseSimulationNumber(rawValue, phValue) || phValue < 0.0f || phValue > 14.0f) {
+        Serial.println(F("[SIM LIVE] pH harus bernilai 0 sampai 14."));
+        return true;
+      }
+      phProvided = true;
+    } else if (key.equalsIgnoreCase("rain")) {
+      if (!parseSimulationNumber(rawValue, rainValue) || rainValue < 0.0f || rainValue > 100.0f) {
+        Serial.println(F("[SIM LIVE] Peluang hujan harus 0 sampai 100 persen."));
+        return true;
+      }
+      rainProvided = true;
+    } else if (key.equalsIgnoreCase("flow_pulses")) {
+      if (!parseSimulationNumber(rawValue, flowPulsesValue) ||
+          flowPulsesValue < 0.0f || flowPulsesValue > 2000000.0f ||
+          floorf(flowPulsesValue) != flowPulsesValue) {
+        Serial.println(F("[SIM LIVE] flow_pulses harus bilangan bulat 0 sampai 2000000."));
+        return true;
+      }
+      flowProvided = true;
+    } else if (key.equalsIgnoreCase("flow_seconds")) {
+      if (!parseSimulationNumber(rawValue, flowSeconds) || flowSeconds <= 0.0f || flowSeconds > 1800.0f) {
+        Serial.println(F("[SIM LIVE] flow_seconds harus >0 dan <=1800."));
+        return true;
+      }
+      flowSecondsProvided = true;
+    } else {
+      if (!parseSimulationNumber(rawValue, value)) {
+        Serial.printf("[SIM LIVE] Angka tidak valid untuk %s.\n", key.c_str());
+        return true;
+      }
+
+      const char *jsonKey = nullptr;
+      float minValue = -100.0f;
+      float maxValue = 100.0f;
+      if (key.equalsIgnoreCase("soil") || key.equalsIgnoreCase("soil_moisture")) {
+        jsonKey = "soil_moisture";
+        minValue = 0.0f;
+        maxValue = 100.0f;
+      } else if (key.equalsIgnoreCase("temp") || key.equalsIgnoreCase("temperature")) {
+        jsonKey = "temperature";
+        minValue = -40.0f;
+        maxValue = 80.0f;
+      } else if (key.equalsIgnoreCase("rh") || key.equalsIgnoreCase("humidity")) {
+        jsonKey = "humidity";
+        minValue = 0.0f;
+        maxValue = 100.0f;
+      } else if (key.equalsIgnoreCase("soil_temp")) {
+        jsonKey = "soil_temp";
+        minValue = -40.0f;
+        maxValue = 100.0f;
+      } else if (key.equalsIgnoreCase("ambient_temp")) {
+        jsonKey = "ambient_temp";
+        minValue = -40.0f;
+        maxValue = 80.0f;
+      } else if (key.equalsIgnoreCase("ambient_hum")) {
+        jsonKey = "ambient_hum";
+        minValue = 0.0f;
+        maxValue = 100.0f;
+      } else if (key.equalsIgnoreCase("battery")) {
+        jsonKey = "battery";
+        minValue = 0.0f;
+        maxValue = 6.0f;
+      } else {
+        Serial.printf("[SIM LIVE] Parameter tidak dikenal: %s\n", key.c_str());
+        return true;
+      }
+
+      if (value < minValue || value > maxValue) {
+        Serial.printf("[SIM LIVE] Nilai %s di luar rentang %.1f sampai %.1f.\n",
+                      key.c_str(), minValue, maxValue);
+        return true;
+      }
+      sensorDoc[jsonKey] = value;
+      sensorFieldProvided = true;
+    }
+    position = tokenEnd + 1;
+  }
+
+  if (liveOffRequested) {
+    if (liveOnRequested || nodeProvided || phProvided || rainProvided || flowProvided || sensorFieldProvided) {
+      Serial.println(F("[SIM LIVE] live=off harus dikirim sendiri."));
+      return true;
+    }
+    disableLiveSimulation("PERINTAH_SERIAL");
+    return true;
+  }
+
+  if (liveOnRequested) {
+    if (nodeProvided || phProvided || rainProvided || flowProvided || sensorFieldProvided) {
+      Serial.println(F("[SIM LIVE] Arm harus dikirim terpisah dari data sensor."));
+      return true;
+    }
+    if (!confirmed) {
+      Serial.println(F("[SIM LIVE] Ditolak. Untuk mengizinkan relay fisik, kirim SIM live=on confirm=ARM."));
+      return true;
+    }
+    if (liveSimulationArmed) {
+      Serial.println(F("[SIM LIVE] Sudah aktif."));
+      return true;
+    }
+    if (!modeSistem.equalsIgnoreCase("OTOMATIS")) {
+      Serial.println(F("[SIM LIVE] Sistem harus dalam mode OTOMATIS; ubah melalui dashboard sebelum arm."));
+      return true;
+    }
+    if (!mqttClient.connected()) {
+      Serial.println(F("[SIM LIVE] MQTT belum terhubung; tidak di-arm agar data uji bisa terlihat di web."));
+      return true;
+    }
+    if (actuatorState != STATE_IDLE || statusIrigasi || statusFertigasi || statusPompa) {
+      Serial.println(F("[SIM LIVE] Pastikan semua aktuator OFF sebelum arm."));
+      return true;
+    }
+
+    liveSimulationSavedPh = gatewayPh;
+    liveSimulationSavedSessionLiters = sessionWaterLiters;
+    liveSimulationSavedFlowRate = flowRateLpm;
+    noInterrupts();
+    liveSimulationSavedSessionPulses = sessionFlowPulses;
+    interrupts();
+    liveSimulationNode1Seen = 0;
+    liveSimulationNode2Seen = 0;
+    liveSimulationNode3Seen = 0;
+    liveSimulationExpiresAt = millis() + 600000UL;
+    liveSimulationArmed = true;
+    Serial.println(F("[SIM LIVE] ARMED 10 menit. Input SIM node/ph/rain dikirim ke web; SIM run memakai logika aktuator nyata."));
+    Serial.println(F("[SIM LIVE] Pastikan pompa/katup aman secara fisik. SIM live=off atau SIM reset mematikan aktuator dan disarm."));
+    return true;
+  }
+
+  if (!liveSimulationArmed) {
+    Serial.println(F("[SIM LIVE] Ditolak: arm dahulu dengan SIM live=on confirm=ARM."));
+    return true;
+  }
+  if ((int32_t)(millis() - liveSimulationExpiresAt) >= 0) {
+    disableLiveSimulation("ARM_EXPIRED");
+    return true;
+  }
+  if (!mqttClient.connected()) {
+    disableLiveSimulation("MQTT_LOST");
+    Serial.println(F("[SIM LIVE] Disarmed karena koneksi MQTT terputus."));
+    return true;
+  }
+  if (flowSecondsProvided && !flowProvided) {
+    Serial.println(F("[SIM LIVE] flow_seconds hanya boleh dipakai bersama flow_pulses."));
+    return true;
+  }
+  if (flowProvided && flowSecondsProvided && (nodeProvided || phProvided || rainProvided || sensorFieldProvided)) {
+    Serial.println(F("[SIM LIVE] Kirim data sensor dan pulsa flow sebagai perintah terpisah."));
+    return true;
+  }
+  if (flowProvided && !flowSecondsProvided) flowSeconds = 1.0f;
+
+  if (nodeProvided) {
+    if (phProvided || rainProvided || flowProvided) {
+      Serial.println(F("[SIM LIVE] Input node harus dikirim terpisah dari pH, hujan, dan flow."));
+      return true;
+    }
+    if (!sensorFieldProvided) {
+      Serial.println(F("[SIM LIVE] Tambahkan minimal satu field sensor, misalnya node=1 soil=30 temp=28 rh=65."));
+      return true;
+    }
+    if ((nodeId == 1 || nodeId == 2) &&
+        (sensorDoc["soil_temp"].is<float>() || sensorDoc["ambient_temp"].is<float>() ||
+         sensorDoc["ambient_hum"].is<float>())) {
+      Serial.println(F("[SIM LIVE] Node 1/2 menerima soil, temp, rh, battery."));
+      return true;
+    }
+    if (nodeId == 3 &&
+        (sensorDoc["soil_moisture"].is<float>() || sensorDoc["temperature"].is<float>() ||
+         sensorDoc["humidity"].is<float>())) {
+      Serial.println(F("[SIM LIVE] Node 3 menerima soil_temp, ambient_temp, ambient_hum, battery."));
+      return true;
+    }
+
+    sensorDoc["node_id"] = nodeId;
+    sensorDoc["simulation"] = true;
+    String jsonPayload;
+    serializeJson(sensorDoc, jsonPayload);
+    processIncomingJson(jsonPayload, "SIM-LIVE");
+    if (nodeId == 1) liveSimulationNode1Seen = node1.lastSeen;
+    else if (nodeId == 2) liveSimulationNode2Seen = node2.lastSeen;
+    else liveSimulationNode3Seen = node3.lastSeen;
+    Serial.printf("[SIM LIVE] Node %d diproses dan dipublikasikan ke MQTT/web.\n", nodeId);
+    return true;
+  }
+
+  if (sensorFieldProvided) {
+    Serial.println(F("[SIM LIVE] Field sensor memerlukan node=1, 2, atau 3."));
+    return true;
+  }
+  if (phProvided) {
+    if (rainProvided || flowProvided) {
+      Serial.println(F("[SIM LIVE] Input pH harus dikirim terpisah."));
+      return true;
+    }
+    if (xDataMutex != NULL && xSemaphoreTake(xDataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      gatewayPh = phValue;
+      xSemaphoreGive(xDataMutex);
+    }
+    publishPhMqtt(gatewayPh, true, false);
+    publishIrrigationScoreMqtt();
+    updateDynamicValues();
+    lastDisplayUpdate = millis();
+    Serial.printf("[SIM LIVE] pH %.2f diproses dan dipublikasikan ke MQTT/web.\n", gatewayPh);
+    return true;
+  }
+  if (rainProvided) {
+    if (flowProvided) {
+      Serial.println(F("[SIM LIVE] Peluang hujan harus dikirim terpisah dari flow."));
+      return true;
+    }
+    peluangHujan = rainValue;
+    publishIrrigationScoreMqtt();
+    Serial.printf("[SIM LIVE] Peluang hujan %.1f%% diterapkan pada evaluasi otomatis.\n", peluangHujan);
+    return true;
+  }
+  if (flowProvided) {
+    if (actuatorState == STATE_IDLE || (actuatorState != STATE_IRIGASI_ACTIVE &&
+        actuatorState != STATE_FERTIGASI_ACTIVE && actuatorState != STATE_POST_FLUSH_ACTIVE)) {
+      Serial.println(F("[SIM LIVE] Tidak ada tahap aktuator aktif untuk menerima flow."));
+      return true;
+    }
+    uint32_t pulses = (uint32_t)flowPulsesValue;
+    noInterrupts();
+    uint32_t previousStagePulses = sessionFlowPulses;
+    if (UINT32_MAX - previousStagePulses < pulses) {
+      interrupts();
+      Serial.println(F("[SIM LIVE] Jumlah pulsa akan melewati batas counter; input dibatalkan."));
+      return true;
+    }
+    sessionFlowPulses += pulses;
+    uint32_t stagePulses = sessionFlowPulses;
+    interrupts();
+    sessionWaterLiters = (float)stagePulses / FLOW_PULSES_PER_LITER;
+    flowRateLpm = ((float)pulses / FLOW_PULSES_PER_LITER) * (60.0f / flowSeconds);
+    Serial.printf("[SIM LIVE] Flow %lu pulsa (+%.3f L) | Flow sesi=%.3f L | Debit=%.2f L/min\n",
+                  (unsigned long)pulses,
+                  (float)pulses / FLOW_PULSES_PER_LITER,
+                  sessionWaterLiters, flowRateLpm);
+    publishActuatorMqtt();
+    return true;
+  }
+
+  Serial.println(F("[SIM LIVE] Tidak ada input. Gunakan node=..., ph=..., rain=..., flow_pulses=..., RUN, atau live=off."));
+  return true;
+}
+
+const char *namaTahapSimulasi(SimulatedActuatorState state) {
+  switch (state) {
+    case SIM_IRRIGATION_ACTIVE: return "IRIGASI";
+    case SIM_FERTIGATION_ACTIVE: return "FERTIGASI";
+    case SIM_PREWET_ACTIVE: return "PRE-WET";
+    case SIM_POST_FLUSH_ACTIVE: return "POST-FLUSH";
+    default: return "IDLE";
+  }
+}
+
+void tampilkanStatusSimulasi() {
+  if (simulatedActuatorState == SIM_ACTUATOR_IDLE) {
+    Serial.printf("[SIM] Status=IDLE | Hasil terakhir=%s\n", simulatedLastResult.c_str());
+    return;
+  }
+
+  Serial.printf("[SIM] Status=AKTIF | Tahap=%s | Volume=%.3f/%.3f L | Relay irigasi=%s | Relay fertigasi=%s\n",
+                namaTahapSimulasi(simulatedActuatorState),
+                simulatedStageLiters, simulatedStageTargetLiters,
+                (simulatedActuatorState == SIM_IRRIGATION_ACTIVE ||
+                 simulatedActuatorState == SIM_PREWET_ACTIVE ||
+                 simulatedActuatorState == SIM_POST_FLUSH_ACTIVE) ? "SIMULASI ON" : "OFF",
+                simulatedActuatorState == SIM_FERTIGATION_ACTIVE ? "SIMULASI ON" : "OFF");
+}
+
+void resetSimulasiAktuator(const char *reason) {
+  simulatedActuatorState = SIM_ACTUATOR_IDLE;
+  simulatedStageTargetLiters = 0.0f;
+  simulatedFertigationTargetLiters = 0.0f;
+  simulatedFlushTargetLiters = 0.0f;
+  simulatedStageLiters = 0.0f;
+  simulatedStageElapsedSeconds = 0.0f;
+  simulatedStagePulses = 0;
+  simulatedLastResult = reason;
+}
+
+void selesaikanTahapSimulasi(const char *reason) {
+  Serial.printf("[SIM] %s | Semua relay simulasi OFF.\n", reason);
+  resetSimulasiAktuator(reason);
+}
+
+bool processSimulationFlow(bool pulsesProvided, uint32_t pulses, bool secondsProvided, float seconds) {
+  if (!pulsesProvided && !secondsProvided) return true;
+  if (!pulsesProvided || !secondsProvided || seconds <= 0.0f || seconds > 1800.0f) {
+    Serial.println(F("[SIM] Isi flow_pulses dan flow_seconds bersamaan; durasi harus >0 dan <=1800."));
+    return true;
+  }
+  if (simulatedActuatorState == SIM_ACTUATOR_IDLE) {
+    Serial.println(F("[SIM FLOW] Tidak ada aktuator simulasi yang aktif. Mulai dulu dengan SIM soil=... atau SIM start=fertigasi target=...."));
+    return true;
+  }
+  if (UINT32_MAX - simulatedStagePulses < pulses) {
+    Serial.println(F("[SIM FLOW] Jumlah pulsa simulasi melewati batas counter."));
+    return true;
+  }
+
+  simulatedStagePulses += pulses;
+  simulatedStageLiters = (float)simulatedStagePulses / FLOW_PULSES_PER_LITER;
+  simulatedStageElapsedSeconds += seconds;
+  float batchLiters = (float)pulses / FLOW_PULSES_PER_LITER;
+  float flowRate = batchLiters * 60.0f / seconds;
+
+  Serial.printf("[SIM FLOW] Tahap=%s | Pulsa tahap=%lu | Volume tahap=%.3f/%.3f L | Debit interval=%.3f L/min | Waktu tahap=%.1f s\n",
+                namaTahapSimulasi(simulatedActuatorState),
+                (unsigned long)simulatedStagePulses,
+                simulatedStageLiters, simulatedStageTargetLiters,
+                flowRate, simulatedStageElapsedSeconds);
+
+  if (simulatedStageLiters >= simulatedStageTargetLiters) {
+    if (simulatedActuatorState == SIM_PREWET_ACTIVE) {
+      simulatedActuatorState = SIM_FERTIGATION_ACTIVE;
+      simulatedStageTargetLiters = simulatedFertigationTargetLiters;
+      simulatedStageLiters = 0.0f;
+      simulatedStageElapsedSeconds = 0.0f;
+      simulatedStagePulses = 0;
+      Serial.printf("[SIM] PRE-WET selesai; relay IRIGASI simulasi OFF, relay FERTIGASI simulasi ON (target %.2f L).\n",
+                    simulatedStageTargetLiters);
+    } else if (simulatedActuatorState == SIM_FERTIGATION_ACTIVE && simulatedFlushTargetLiters > 0.0f) {
+      simulatedActuatorState = SIM_POST_FLUSH_ACTIVE;
+      simulatedStageTargetLiters = simulatedFlushTargetLiters;
+      simulatedStageLiters = 0.0f;
+      simulatedStageElapsedSeconds = 0.0f;
+      simulatedStagePulses = 0;
+      Serial.printf("[SIM] Dosis fertigasi selesai; relay FERTIGASI simulasi OFF, relay IRIGASI bilas simulasi ON (target %.2f L).\n",
+                    simulatedStageTargetLiters);
+    } else {
+      selesaikanTahapSimulasi(
+        simulatedActuatorState == SIM_FERTIGATION_ACTIVE ? "TARGET_FERTIGASI_TERCAPAI" :
+        simulatedActuatorState == SIM_POST_FLUSH_ACTIVE ? "SIKLUS_FERTIGASI_SELESAI" :
+        "TARGET_IRIGASI_TERCAPAI");
+      return true;
+    }
+    return true;
+  }
+
+  float timeoutSeconds = simulatedActuatorState == SIM_IRRIGATION_ACTIVE ? 180.0f : 120.0f;
+  if (simulatedStageElapsedSeconds > timeoutSeconds) {
+    selesaikanTahapSimulasi("SAFETY_TIMEOUT");
+  } else if (simulatedStageElapsedSeconds > 35.0f && simulatedStageLiters < 0.03f) {
+    selesaikanTahapSimulasi("NO_FLOW_DETECTED");
+  } else {
+    tampilkanStatusSimulasi();
+  }
+  return true;
+}
+
+bool handleSimulationCommand(String command) {
+  command.trim();
+  if (command.isEmpty()) return false;
+
+  int firstSpace = command.indexOf(' ');
+  String verb = (firstSpace < 0) ? command : command.substring(0, firstSpace);
+  if (!verb.equalsIgnoreCase("SIM") && !verb.equalsIgnoreCase("SIMULATE")) return false;
+
+  String args = (firstSpace < 0) ? "" : command.substring(firstSpace + 1);
+  args.trim();
+  if (args.isEmpty() || args.equalsIgnoreCase("HELP")) {
+    Serial.println(F("[SIM LIVE] Nyata (fisik): SIM live=on confirm=ARM | SIM node=1 soil=30 temp=28 rh=65 | SIM ph=6.5 | SIM run | SIM flow_pulses=450 flow_seconds=10 | SIM live=off"));
+    Serial.println(F("[SIM LIVE] Arm memerlukan mode OTOMATIS + MQTT, berlaku 10 menit. Output aktual dapat mengaktifkan relay fisik."));
+    Serial.println(F("[SIM] Start otomatis irigasi: SIM soil=30 critical=35 upper=75 cooldown=ready"));
+    Serial.println(F("[SIM] Start fertigasi uji: SIM start=fertigasi target=1.0 [prewet=0.5] [flush=0.3]"));
+    Serial.println(F("[SIM] Tambah pulsa: SIM flow_pulses=450 flow_seconds=10 (pulsa adalah tambahan sejak input flow terakhir)."));
+    Serial.println(F("[SIM] Status/reset: SIM status | SIM reset. Semua output hanya dry-run, bukan relay fisik."));
+    return true;
+  }
+
+  if (args.equalsIgnoreCase("STATUS")) {
+    tampilkanStatusSimulasi();
+    Serial.printf("[SIM LIVE] Arm=%s | Mode=%s | Fisik irigasi=%s, fertigasi=%s, pompa=%s\n",
+                  liveSimulationArmed ? "AKTIF" : "OFF",
+                  modeSistem.c_str(),
+                  statusIrigasi ? "ON" : "OFF",
+                  statusFertigasi ? "ON" : "OFF",
+                  statusPompa ? "ON" : "OFF");
+    return true;
+  }
+  if (args.equalsIgnoreCase("RESET") || args.equalsIgnoreCase("STOP")) {
+    disableLiveSimulation("RESET_MANUAL");
+    resetSimulasiAktuator("RESET_MANUAL");
+    Serial.println(F("[SIM] Sesi simulasi direset; semua relay simulasi OFF."));
+    return true;
+  }
+  if (args.equalsIgnoreCase("RUN") || args.startsWith("live=") ||
+      args.startsWith("node=") || args.startsWith("ph=") ||
+      (liveSimulationArmed && (args.startsWith("rain=") || args.startsWith("flow_pulses=")))) {
+    return handleLiveSimulationCommand(args);
+  }
+
+  float soil1 = NAN;
+  float soil2 = NAN;
+  float critical = ambangKritis;
+  float upper = ambangAtas;
+  float temperature = 28.0f;
+  float humidity = 65.0f;
+  float rain = 0.0f;
+  float scoreActive = ambangSkorAktif;
+  float scoreBelow = ambangSkorBawah;
+  float tempHigh = ambangTempHigh;
+  float humLow = ambangHumLow;
+  float flowPulses = NAN;
+  float flowSeconds = NAN;
+  float explicitTarget = NAN;
+  float prewetTarget = 0.0f;
+  float flushTarget = 0.0f;
+  String startMode = "";
+  bool soil1Provided = false;
+  bool flowPulsesProvided = false;
+  bool flowSecondsProvided = false;
+  bool previousCycleActive = false;
+  bool cooldownReady = true;
+
+  int position = 0;
+  while (position < args.length()) {
+    while (position < args.length() && args.charAt(position) == ' ') position++;
+    if (position >= args.length()) break;
+
+    int tokenEnd = args.indexOf(' ', position);
+    if (tokenEnd < 0) tokenEnd = args.length();
+    String token = args.substring(position, tokenEnd);
+    int equalsAt = token.indexOf('=');
+    if (equalsAt <= 0 || equalsAt == (int)token.length() - 1) {
+      Serial.printf("[SIM] Parameter tidak valid: %s\n", token.c_str());
+      return true;
+    }
+
+    String key = token.substring(0, equalsAt);
+    String rawValue = token.substring(equalsAt + 1);
+    float value = 0.0f;
+
+    if (key.equalsIgnoreCase("start")) {
+      startMode = rawValue;
+    } else if (key.equalsIgnoreCase("cycle")) {
+      if (rawValue.equalsIgnoreCase("on")) previousCycleActive = true;
+      else if (rawValue.equalsIgnoreCase("off")) previousCycleActive = false;
+      else {
+        Serial.println(F("[SIM] cycle harus on atau off."));
+        return true;
+      }
+    } else if (key.equalsIgnoreCase("cooldown")) {
+      if (rawValue.equalsIgnoreCase("ready")) cooldownReady = true;
+      else if (rawValue.equalsIgnoreCase("wait")) cooldownReady = false;
+      else {
+        Serial.println(F("[SIM] cooldown harus ready atau wait."));
+        return true;
+      }
+    } else {
+      if (!parseSimulationNumber(rawValue, value)) {
+        Serial.printf("[SIM] Angka tidak valid untuk %s: %s\n", key.c_str(), rawValue.c_str());
+        return true;
+      }
+      if (key.equalsIgnoreCase("soil") || key.equalsIgnoreCase("soil1")) {
+        soil1 = value;
+        soil1Provided = true;
+      } else if (key.equalsIgnoreCase("soil2")) {
+        soil2 = value;
+      } else if (key.equalsIgnoreCase("critical") || key.equalsIgnoreCase("threshold")) {
+        critical = value;
+      } else if (key.equalsIgnoreCase("upper")) {
+        upper = value;
+      } else if (key.equalsIgnoreCase("temp")) {
+        temperature = value;
+      } else if (key.equalsIgnoreCase("rh")) {
+        humidity = value;
+      } else if (key.equalsIgnoreCase("rain")) {
+        rain = value;
+      } else if (key.equalsIgnoreCase("score_on")) {
+        scoreActive = value;
+      } else if (key.equalsIgnoreCase("score_off")) {
+        scoreBelow = value;
+      } else if (key.equalsIgnoreCase("temp_high")) {
+        tempHigh = value;
+      } else if (key.equalsIgnoreCase("hum_low")) {
+        humLow = value;
+      } else if (key.equalsIgnoreCase("flow_pulses")) {
+        flowPulses = value;
+        flowPulsesProvided = true;
+      } else if (key.equalsIgnoreCase("flow_seconds")) {
+        flowSeconds = value;
+        flowSecondsProvided = true;
+      } else if (key.equalsIgnoreCase("target")) {
+        explicitTarget = value;
+      } else if (key.equalsIgnoreCase("prewet")) {
+        prewetTarget = value;
+      } else if (key.equalsIgnoreCase("flush")) {
+        flushTarget = value;
+      } else {
+        Serial.printf("[SIM] Parameter tidak dikenal: %s\n", key.c_str());
+        return true;
+      }
+    }
+    position = tokenEnd + 1;
+  }
+
+  if ((soil1Provided && (soil1 < 0.0f || soil1 > 100.0f)) ||
+      (!isnan(soil2) && (soil2 < 0.0f || soil2 > 100.0f)) ||
+      critical < 0.0f || critical > 100.0f ||
+      upper < 0.0f || upper > 100.0f ||
+      temperature <= 0.0f || temperature > 80.0f ||
+      humidity <= 0.0f || humidity > 100.0f ||
+      rain < 0.0f || rain > 100.0f ||
+      scoreActive < 0.0f || scoreActive > 100.0f ||
+      scoreBelow < 0.0f || scoreBelow > 100.0f ||
+      tempHigh <= 0.0f || tempHigh > 80.0f ||
+      humLow < 0.0f || humLow > 100.0f ||
+      (flowPulsesProvided != flowSecondsProvided) ||
+      (flowPulsesProvided &&
+       (flowPulses < 0.0f || flowPulses > 2000000.0f ||
+        floorf(flowPulses) != flowPulses || flowSeconds <= 0.0f || flowSeconds > 1800.0f)) ||
+      (!isnan(explicitTarget) && (explicitTarget < 0.2f || explicitTarget > 8.0f)) ||
+      prewetTarget < 0.0f || prewetTarget > 8.0f ||
+      flushTarget < 0.0f || flushTarget > 8.0f) {
+    Serial.println(F("[SIM] Input di luar rentang atau pasangan flow tidak valid. Soil/rain/threshold 0-100; pulsa bilangan bulat; target 0.2-8 L."));
+    return true;
+  }
+
+  if ((!startMode.isEmpty() || soil1Provided) && simulatedActuatorState != SIM_ACTUATOR_IDLE) {
+    Serial.println(F("[SIM] Sesi sedang aktif. Kirim SIM flow_pulses=... flow_seconds=..., SIM status, atau SIM reset."));
+    return true;
+  }
+
+  bool startIrrigation = false;
+  bool startFertigation = false;
+  float targetLiters = 0.0f;
+  const char *reason = "SKOR_DI_BAWAH_AMBANG";
+
+  if (startMode.equalsIgnoreCase("fertigasi")) {
+    if (isnan(explicitTarget)) {
+      Serial.println(F("[SIM] start=fertigasi memerlukan target=... dalam liter."));
+      return true;
+    }
+    startFertigation = true;
+    targetLiters = explicitTarget;
+    reason = "UJI_FERTIGASI_MANUAL";
+  } else if (startMode.equalsIgnoreCase("irigasi")) {
+    if (isnan(explicitTarget)) {
+      Serial.println(F("[SIM] start=irigasi memerlukan target=... dalam liter."));
+      return true;
+    }
+    if (prewetTarget > 0.0f || flushTarget > 0.0f) {
+      Serial.println(F("[SIM] prewet/flush hanya berlaku untuk start=fertigasi."));
+      return true;
+    }
+    startIrrigation = true;
+    targetLiters = explicitTarget;
+    reason = "UJI_IRIGASI_MANUAL";
+  } else if (startMode.isEmpty() || startMode.equalsIgnoreCase("auto")) {
+    if (soil1Provided) {
+      float soilRep = NAN;
+      float soilMin = NAN;
+      hitungMetrikTanah(soil1, soil2, soilRep, soilMin);
+      IrrigationScoreResult score = calculateIrrigationScore(
+        soilRep, temperature, humidity, rain, upper, critical,
+        scoreActive, scoreBelow, previousCycleActive);
+      if (!score.valid) {
+        Serial.println(F("[SIM] Skor tidak dapat dihitung. Periksa input sensor."));
+        return true;
+      }
+
+      IrrigationDecision decision = evaluasiKeputusanIrigasi(
+        soilRep, soilMin, rain, critical, upper, score.total,
+        scoreActive, score.cycleActive, cooldownReady);
+      if (decision == IRRIGATION_EMERGENCY) {
+        targetLiters = calculateTargetVolumeAir(
+          soilMin, score.vpd, 65.0f, temperature, humidity,
+          upper, tempHigh, humLow, faseVegetatif);
+        targetLiters = max(targetLiters, 1.2f);
+        startIrrigation = true;
+        reason = "TANAH_KRITIS";
+      } else if (decision == IRRIGATION_SCORE_TRIGGER) {
+        targetLiters = calculateTargetVolumeAir(
+          soilRep, score.vpd, score.total, temperature, humidity,
+          upper, tempHigh, humLow, faseVegetatif);
+        if (targetLiters >= 0.30f) {
+          startIrrigation = true;
+          reason = "SKOR_MEMENUHI_AMBANG";
+        } else {
+          reason = "TARGET_VOLUME_TIDAK_MEMENUHI_MINIMUM";
+        }
+      } else if (decision == IRRIGATION_SOIL_SATURATED) {
+        reason = "TANAH_SUDAH_BASAH";
+      } else if (decision == IRRIGATION_HEAVY_RAIN) {
+        reason = "PREDIKSI_HUJAN_DERAS";
+      } else if (decision == IRRIGATION_WAIT_COOLDOWN) {
+        reason = "MENUNGGU_COOLDOWN";
+      }
+
+      Serial.println(F("[SIM] ===== EVALUASI IRIGASI OTOMATIS ====="));
+      String soil2Display = isnan(soil2) ? String("tidak diisi") : String(soil2, 1);
+      Serial.printf("[SIM] Soil 1=%.1f%% | Soil 2=%s | Representatif=%.1f%% | Minimum=%.1f%%\n",
+                    soil1, soil2Display.c_str(), soilRep, soilMin);
+      Serial.printf("[SIM] Threshold kritis=%.1f%% | Atas=%.1f%% | Suhu=%.1f C | RH=%.1f%% | Hujan=%.1f%%\n",
+                    critical, upper, temperature, humidity, rain);
+      Serial.printf("[SIM] VPD=%.2f kPa | Skor tanah=%.1f | VPD=%.1f | Interaksi=%.1f | Pengurang hujan=%.1f | Total=%.1f\n",
+                    score.vpd, score.soil, score.vpdScore, score.interaction, score.rain, score.total);
+      Serial.printf("[SIM] Siklus histeresis=%s | Cooldown=%s\n",
+                    score.cycleActive ? "AKTIF" : "NONAKTIF",
+                    cooldownReady ? "SIAP" : "MENUNGGU");
+      Serial.printf("[SIM] Keputusan=%s | Target=%.2f L\n", reason, targetLiters);
+    } else if (!startMode.isEmpty()) {
+      Serial.println(F("[SIM] start=auto memerlukan soil=...; untuk uji langsung gunakan start=irigasi target=... atau start=fertigasi target=...."));
+      return true;
+    }
+  } else {
+    Serial.println(F("[SIM] start harus auto, irigasi, atau fertigasi."));
+    return true;
+  }
+
+  if (startIrrigation || startFertigation) {
+    if (startIrrigation) {
+      simulatedActuatorState = prewetTarget > 0.0f ? SIM_PREWET_ACTIVE : SIM_IRRIGATION_ACTIVE;
+      simulatedStageTargetLiters = prewetTarget > 0.0f ? prewetTarget : targetLiters;
+      simulatedFlushTargetLiters = 0.0f;
+    } else {
+      simulatedActuatorState = prewetTarget > 0.0f ? SIM_PREWET_ACTIVE : SIM_FERTIGATION_ACTIVE;
+      simulatedStageTargetLiters = prewetTarget > 0.0f ? prewetTarget : targetLiters;
+      simulatedFertigationTargetLiters = targetLiters;
+      simulatedFlushTargetLiters = flushTarget;
+    }
+    simulatedStageLiters = 0.0f;
+    simulatedStageElapsedSeconds = 0.0f;
+    simulatedStagePulses = 0;
+    Serial.printf("[SIM] Keputusan=%s | Relay irigasi=%s | Relay fertigasi=%s | Target tahap=%.2f L\n",
+                  reason,
+                  (simulatedActuatorState == SIM_IRRIGATION_ACTIVE || simulatedActuatorState == SIM_PREWET_ACTIVE) ? "SIMULASI ON" : "OFF",
+                  simulatedActuatorState == SIM_FERTIGATION_ACTIVE ? "SIMULASI ON" : "OFF",
+                  simulatedStageTargetLiters);
+  } else if (!soil1Provided && !flowPulsesProvided) {
+    Serial.println(F("[SIM] Perintah tidak berisi input. Ketik SIM help untuk format."));
+    return true;
+  }
+
+  if (flowPulsesProvided) {
+    return processSimulationFlow(true, (uint32_t)flowPulses, true, flowSeconds);
+  }
+
+  if (startIrrigation || startFertigation) tampilkanStatusSimulasi();
+  return true;
+}
+
 void processIncomingJson(const String& cleanJson, const char* source) {
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, cleanJson);
 
   if (!error) {
+    const bool persistTelemetry = strncmp(source, "SIM-LIVE", 8) != 0;
     totalPacketsReceived++;
 
     int nodeId = 0;
@@ -2890,7 +3748,7 @@ void processIncomingJson(const String& cleanJson, const char* source) {
         extractUint(doc, "counter", "count", "pkt", node1.counter);
         pendingPublishNode = 1;
 
-        saveTelemetryNVS(1);
+        if (persistTelemetry) saveTelemetryNVS(1);
 
         Serial.printf("[SYNC -> LCD N1] Suhu=%.1f C | Lembap=%.1f %% | Tanah=%.1f %% | Bat=%.2f V (%d%%) | Pkt=%lu\n",
                       node1.temperature, node1.humidity, node1.soil_moisture, node1.battery, hitungPersenBaterai(node1.battery), (unsigned long)node1.counter);
@@ -2911,7 +3769,7 @@ void processIncomingJson(const String& cleanJson, const char* source) {
         extractUint(doc, "counter", "count", "pkt", node2.counter);
         pendingPublishNode = 2;
 
-        saveTelemetryNVS(2);
+        if (persistTelemetry) saveTelemetryNVS(2);
 
         Serial.printf("[SYNC -> LCD N2] Suhu=%.1f C | Lembap=%.1f %% | Tanah=%.1f %% | Bat=%.2f V (%d%%) | Pkt=%lu\n",
                       node2.temperature, node2.humidity, node2.soil_moisture, node2.battery, hitungPersenBaterai(node2.battery), (unsigned long)node2.counter);
@@ -2985,7 +3843,7 @@ void processIncomingJson(const String& cleanJson, const char* source) {
         n3Copy = node3;
         pendingPublishNode = 3;
 
-        saveTelemetryNVS(3);
+        if (persistTelemetry) saveTelemetryNVS(3);
 
         Serial.printf("[SYNC -> LCD N3] T_Gambut=%.2f C | FWI=%.2f [%s] | Bat=%.2f V (%d%%) | Pkt=%lu\n",
                       node3.soil_temp, node3.fwi_score, BMKG_LEVEL_STR[node3.fwi_level < 5 ? node3.fwi_level : 4],
@@ -3001,11 +3859,11 @@ void processIncomingJson(const String& cleanJson, const char* source) {
 
     // Publikasi MQTT di luar xDataMutex
     if (pendingPublishNode == 1) {
-      processData(1, cleanJson);
+      processData(1, cleanJson, persistTelemetry);
     } else if (pendingPublishNode == 2) {
-      processData(2, cleanJson);
+      processData(2, cleanJson, persistTelemetry);
     } else if (pendingPublishNode == 3) {
-      publishNode3Mqtt(n3Copy);
+      publishNode3Mqtt(n3Copy, !persistTelemetry, persistTelemetry);
     }
   } else {
     Serial.printf("[JSON ERR] Gagal deserialize dari %s: %s | Raw: %s\n", source, error.c_str(), cleanJson.c_str());
@@ -3047,7 +3905,13 @@ void readSerialStreams() {
     char c = Serial.read();
     if (c == '\r') continue;
     serialUsbBuffer += c;
-    if (c == '\n' || c == '}') {
+    if (c == '\n') {
+      if (handleSimulationCommand(serialUsbBuffer)) {
+        serialUsbBuffer = "";
+      } else {
+        parseBufferStream(serialUsbBuffer, "USB-SERIAL");
+      }
+    } else if (c == '}') {
       parseBufferStream(serialUsbBuffer, "USB-SERIAL");
     }
   }
@@ -3315,6 +4179,14 @@ unsigned long lastAutoEval = 0;
 unsigned long lastActPub = 0;
 
 void loop() {
+  if (liveSimulationArmed) {
+    if ((int32_t)(millis() - liveSimulationExpiresAt) >= 0) {
+      disableLiveSimulation("ARM_EXPIRED");
+    } else if (!mqttClient.connected()) {
+      disableLiveSimulation("MQTT_LOST");
+    }
+  }
+
   // 1. Baca UART Serial2 (ESP8266 Receiver) & USB Serial (Serial Monitor PC) secara real-time di Core 1
   // Menjamin seluruh paket data Node 1, 2, 3 selalu diterima dan tersinkron langsung ke layar LCD TFT
   readSerialStreams();
@@ -3323,7 +4195,7 @@ void loop() {
   updateIndicatorLamps();
 
   // 2. Pembacaan Sensor pH Lokal ESP32 (ADC GPIO 36) setiap 2 detik
-  if (millis() - lastPhReadTime >= 2000UL) {
+  if (!liveSimulationArmed && millis() - lastPhReadTime >= 2000UL) {
     lastPhReadTime = millis();
     float phVal = bacaSensorPhLokal();
 
@@ -3355,14 +4227,14 @@ void loop() {
 
   // 5. Evaluasi Penjadwalan Waktu (Jadwal Penyiraman Otomatis Tepat Waktu)
   static unsigned long lastScheduleEval = 0;
-  if (millis() - lastScheduleEval >= 1000UL) {
+  if (!liveSimulationArmed && millis() - lastScheduleEval >= 1000UL) {
     evaluasiJadwalPenyiraman();
     lastScheduleEval = millis();
   }
 
   // 6. Evaluasi Otomatisasi Responsif Sensor (Irigasi Hortikultura & Rewetting Gambut Node 3)
   if (millis() - lastAutoEval >= 3000UL) {
-    evaluasiAktuatorOtomatis();
+    if (!liveSimulationArmed) evaluasiAktuatorOtomatis();
     lastAutoEval = millis();
   }
 
@@ -3384,7 +4256,7 @@ void loop() {
   // 8. Simpan metrik sensor lokal ke NVS Flash HANYA saat ada perubahan nilai signifikan
   //    (Optimasi: mengurangi siklus tulis Flash agar chip lebih awet)
   static unsigned long lastLocalNvsCheck = 0;
-  if (millis() - lastLocalNvsCheck >= 20000UL) {
+  if (!liveSimulationArmed && millis() - lastLocalNvsCheck >= 20000UL) {
     lastLocalNvsCheck = millis();
     bool needSave = false;
 
