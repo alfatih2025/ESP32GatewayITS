@@ -10,6 +10,8 @@
 #include <esp_sntp.h>
 #include <esp_task_wdt.h>   // Untuk melepas IDLE0 dari WDT saat TLS handshake
 #include <Preferences.h>    // Penyimpanan permanen NVS Flash untuk mode dan WiFi
+#include <esp_system.h>
+#include <esp_heap_caps.h>
 #include "secret.h"
 
 Preferences prefs;
@@ -25,6 +27,7 @@ void loadAgriSettingsNVS();
 void startIrigasiTerjadwal(int durasiDetik);
 void evaluasiJadwalPenyiraman();
 void startFertigasiSiklus3Tahap(float volNutrisi, float customPreWet = 0.0f, float customPostFlush = 0.0f, bool karhutla = false);
+void recoverTftDisplay();
 
 // =====================================================
 // WIFI CONFIG (Dinamis dari NVS Flash, default dari secret.h)
@@ -58,15 +61,15 @@ String currentPass = "";
 // =====================================================
 // Pin GPIO 16 (RX2) terhubung ke TX ESP8266 Receiver
 // Pin GPIO 17 (TX2) terhubung ke RX ESP8266 Receiver
-#define UART_RX_PIN 3
-#define UART_TX_PIN 1
+#define UART_RX_PIN 16
+#define UART_TX_PIN 17
 #define UART_BAUD   115200
 
 // =====================================================
 // PIN HARDWARE SENSOR & AKTUATOR
 // =====================================================
 #define PIN_PH_SENSOR        36  // GPIO 36 / VP (ADC1_CH0 - Input Analog Sensor pH)
-#define PIN_FLOW_SENSOR      35  // GPIO 27 (Sensor Water Flow YF-S201 Hall-Effect Interrupt)
+#define PIN_FLOW_SENSOR      35  // GPIO 35 (Sensor Water Flow YF-S201 Hall-Effect Interrupt)
 #define PIN_RELAY_IRIGASI    33  // GPIO 33 (Relay 1 - Solenoid Valve Irigasi Air Bersih)
 #define PIN_RELAY_FERTIGASI  32  // GPIO 32 (Relay 2 - Solenoid Valve Fertigasi / Amelioran)
 
@@ -80,7 +83,7 @@ String currentPass = "";
 #define RELAY_ACTIVE_LEVEL   LOW
 #define RELAY_INACTIVE_LEVEL HIGH
 
-// Kalibrasi Sensor Waterflow (YF-S201: ~450 pulsa / Liter)
+// Kalibrasi Sensor Waterflow (ZJ-S201: ~450 pulsa / Liter)
 #define FLOW_PULSES_PER_LITER 450.0f
 
 // =====================================================
@@ -253,9 +256,18 @@ const unsigned long FLOW_IDLE_THRESHOLD = 5000UL; // 5 detik tanpa aliran = dian
 float lastSavedPh = NAN;
 float lastSavedWater = 0.0f;
 
+// Filter debounce software untuk mencegah Interrupt Storm akibat lonjakan listrik / EMI pompa
+volatile unsigned long lastFlowPulseMicros = 0;
+
 void IRAM_ATTR flowSensorISR() {
-  totalFlowPulses++;
-  sessionFlowPulses++;
+  unsigned long nowUs = micros();
+  // Filter glitch / noise induktif: minimum interval 1500 us (maks ~660 Hz / ~88 L/min)
+  // Mencegah freeze Core 1 dan korupsi bus SPI TFT saat relay/motor pompa bekerja
+  if (nowUs - lastFlowPulseMicros >= 1500UL) {
+    lastFlowPulseMicros = nowUs;
+    totalFlowPulses++;
+    sessionFlowPulses++;
+  }
 }
 
 enum ActuatorState {
@@ -281,7 +293,7 @@ bool isKarhutlaCycle = false;
 
 unsigned long lastAutoCycleTime = 0;
 const unsigned long COOLDOWN_AGRI_MS = 15UL * 60UL * 1000UL;
-const unsigned long COOLDOWN_KARHUTLA_MS = 5UL * 60UL * 1000UL;
+const unsigned long COOLDOWN_KARHUTLA_MS = 1UL * 60UL * 1000UL; // 1 menit jeda antar siklus darurat karhutla
 
 // =========================================================================
 // PARAMETER LOGIKA KONTROL FERTIGASI CERDAS (HYBRID HORTIKULTURA & GAMBUT)
@@ -677,18 +689,19 @@ void updateIndicatorLamps(bool force = false) {
 // KONTROL HARDWARE AKTUATOR & LOGIKA CLOSED-LOOP
 // =====================================================
 void initActuatorHardware() {
-  pinMode(PIN_RELAY_IRIGASI, OUTPUT);
+  // Pre-write HIGH terlebih dahulu sebelum pinMode OUTPUT agar relay aktif-LOW tidak terpicu sesaat saat booting
   digitalWrite(PIN_RELAY_IRIGASI, RELAY_INACTIVE_LEVEL);
+  pinMode(PIN_RELAY_IRIGASI, OUTPUT);
 
-  pinMode(PIN_RELAY_FERTIGASI, OUTPUT);
   digitalWrite(PIN_RELAY_FERTIGASI, RELAY_INACTIVE_LEVEL);
+  pinMode(PIN_RELAY_FERTIGASI, OUTPUT);
 
   // Inisialisasi Relay Lampu Indikator Sistem (D26) & WiFi Online (D25)
-  // Pin D26 langsung dinyalakan sebagai penanda ESP32 sudah aktif/menyala
-  pinMode(PIN_RELAY_LAMP_SYSTEM, OUTPUT);
   digitalWrite(PIN_RELAY_LAMP_SYSTEM, RELAY_ACTIVE_LEVEL);
-  pinMode(PIN_RELAY_LAMP_ONLINE, OUTPUT);
+  pinMode(PIN_RELAY_LAMP_SYSTEM, OUTPUT);
+
   digitalWrite(PIN_RELAY_LAMP_ONLINE, RELAY_INACTIVE_LEVEL);
+  pinMode(PIN_RELAY_LAMP_ONLINE, OUTPUT);
   updateIndicatorLamps(true);
 
   pinMode(PIN_FLOW_SENSOR, INPUT_PULLUP);
@@ -756,6 +769,7 @@ void stopAllActuators(const char* reason = "SELESAI") {
 
   digitalWrite(PIN_RELAY_IRIGASI, RELAY_INACTIVE_LEVEL);
   digitalWrite(PIN_RELAY_FERTIGASI, RELAY_INACTIVE_LEVEL);
+  delay(15); // Jeda peredam transien listrik relay
   statusIrigasi = false;
   statusFertigasi = false;
   statusPompa = false;
@@ -792,6 +806,7 @@ void startIrigasiTerjadwal(int durasiDetik) {
   digitalWrite(PIN_RELAY_FERTIGASI, RELAY_INACTIVE_LEVEL);
   statusFertigasi = false;
   digitalWrite(PIN_RELAY_IRIGASI, RELAY_ACTIVE_LEVEL);
+  delay(15); // Jeda peredam transien relay
   statusIrigasi = true;
   statusPompa = true;
   actuatorState = STATE_IRIGASI_ACTIVE;
@@ -818,6 +833,7 @@ void startIrigasi(float targetL, bool autoQueueFert = false, float nextFertTarge
 
   sessionStartTime = millis();
   digitalWrite(PIN_RELAY_IRIGASI, RELAY_ACTIVE_LEVEL);
+  delay(15); // Jeda peredam transien relay
   statusIrigasi = true;
   statusPompa = true;
   actuatorState = STATE_IRIGASI_ACTIVE;
@@ -839,6 +855,7 @@ void startFertigasi(float targetL, bool karhutla = false) {
 
   sessionStartTime = millis();
   digitalWrite(PIN_RELAY_FERTIGASI, RELAY_ACTIVE_LEVEL);
+  delay(15); // Jeda peredam transien relay
   statusFertigasi = true;
   statusPompa = true;
   actuatorState = STATE_FERTIGASI_ACTIVE;
@@ -871,6 +888,7 @@ void startFertigasiSiklus3Tahap(float volNutrisi, float customPreWet, float cust
 
   sessionStartTime = millis();
   digitalWrite(PIN_RELAY_IRIGASI, RELAY_ACTIVE_LEVEL);
+  delay(15); // Jeda peredam transien relay
   statusIrigasi = true;
   statusPompa = true;
   actuatorState = STATE_IRIGASI_ACTIVE;
@@ -925,12 +943,14 @@ void processActuatorFSM() {
       if (now - sessionStartTime > maxTimeout) {
         targetDurasiIrigasiDetik = 0;
         stopAllActuators("SAFETY_TIMEOUT");
+        lastAutoCycleTime = now;
         return;
       }
 
       // 4. NO_FLOW_DETECTED: HANYA berlaku jika BUKAN irigasi durasi terjadwal dan mode otomatis
       if (!isManual && targetDurasiIrigasiDetik == 0 && (now - sessionStartTime > 35000UL) && (sessionWaterLiters < 0.03f)) {
         stopAllActuators("NO_FLOW_DETECTED");
+        lastAutoCycleTime = now;
         safeMqttPublish("sproutai/actuator/alarm", "{\"alarm\":\"NO_WATER_FLOW\",\"valve\":\"IRIGASI\"}");
         return;
       }
@@ -966,12 +986,14 @@ void processActuatorFSM() {
       unsigned long maxTimeout = isManual ? 1800000UL : 120000UL;
       if (now - sessionStartTime > maxTimeout) {
         stopAllActuators("SAFETY_TIMEOUT");
+        lastAutoCycleTime = now;
         return;
       }
 
       // 3. NO_FLOW_DETECTED: tandon nutrisi habis atau pompa macet
       if (!isManual && (now - sessionStartTime > 35000UL) && (sessionWaterLiters < 0.03f)) {
         stopAllActuators("NO_FLOW_DETECTED");
+        lastAutoCycleTime = now;
         safeMqttPublish("sproutai/actuator/alarm", "{\"alarm\":\"NO_FERTILIZER_FLOW\",\"valve\":\"FERTIGASI\"}");
         return;
       }
@@ -1020,11 +1042,13 @@ void processActuatorFSM() {
       unsigned long maxTimeout = isManual ? 1800000UL : 120000UL;
       if (now - sessionStartTime > maxTimeout) {
         stopAllActuators("SAFETY_TIMEOUT");
+        lastAutoCycleTime = now;
         return;
       }
 
       if (!isManual && (now - sessionStartTime > 35000UL) && (sessionWaterLiters < 0.03f)) {
         stopAllActuators("NO_FLOW_DETECTED");
+        lastAutoCycleTime = now;
         safeMqttPublish("sproutai/actuator/alarm", "{\"alarm\":\"NO_WATER_FLOW\",\"valve\":\"IRIGASI_FLUSH\"}");
         return;
       }
@@ -1257,8 +1281,8 @@ void hitungMetrikDuaNode(float &outSoilRep, float &outSoilMin, float &outTemp, f
   bool n1Valid = (node1.active && (node1.lastSeen > 0) && (now - node1.lastSeen < 180000UL) && !isnan(node1.soil_moisture));
   bool n2Valid = (node2.active && (node2.lastSeen > 0) && (now - node2.lastSeen < 180000UL) && !isnan(node2.soil_moisture));
 
-  float s1 = n1Valid ? node1.soil_moisture : (!isnan(node1.soil_moisture) ? node1.soil_moisture : NAN);
-  float s2 = n2Valid ? node2.soil_moisture : (!isnan(node2.soil_moisture) ? node2.soil_moisture : NAN);
+  float s1 = n1Valid ? node1.soil_moisture : NAN;
+  float s2 = n2Valid ? node2.soil_moisture : NAN;
 
   // 1. Kelembapan Tanah Terendah & Representatif
   if (!isnan(s1) && !isnan(s2)) {
@@ -1447,7 +1471,7 @@ void evaluasiAktuatorOtomatis() {
   // PRIORITAS 1: MITIGASI KARHUTLA GAMBUT (KONDISI B: NODE 3 AKTIF & ONLINE)
   // Menangani Lahan Gambut: Bahaya Bara Api Bawah Tanah vs Ameliorasi Masam
   // -----------------------------------------------------------------------
-  bool node3Online = (node3.active && (node3.lastSeen > 0) && (now - node3.lastSeen < 60000UL));
+  bool node3Online = (node3.active && (node3.lastSeen > 0) && (now - node3.lastSeen < 180000UL));
 
   if (node3Online) {
     // 1A. SUB-KONDISI DARURAT BARA GAMBUT (Top Priority - Bypass Jam & Cuaca!)
@@ -1474,6 +1498,10 @@ void evaluasiAktuatorOtomatis() {
         // Siklus 3-Tahap Gambut: Pre-Wet Air Masif -> Injeksi Amelioran Masif -> Post-Flush Bilas
         startFertigasiSiklus3Tahap(targetAmelioran, targetRewetting, 0.8f, true);
         return;
+      } else {
+        unsigned long sisaCooldownDetik = (COOLDOWN_KARHUTLA_MS - (now - lastAutoCycleTime)) / 1000UL;
+        Serial.printf("[AUTO GAMBUT] Suhu/FWI tinggi (T=%.1f C, FWI=%d), menunggu cooldown %lu detik lagi...\n",
+                      isnan(node3.soil_temp) ? 0.0f : node3.soil_temp, node3.fwi_level, sisaCooldownDetik);
       }
     }
 
@@ -1509,8 +1537,8 @@ void evaluasiAktuatorOtomatis() {
   // Jika salah satu titik tanah jatuh <= batas kritis, bypass jadwal jam!
   // Tanaman disiram air bersih murni untuk penyelamatan dehidrasi akut.
   // -----------------------------------------------------------------------
-  if (!isnan(agriSoilMin) && (agriSoilMin <= ambangKritis) && (agriSoilMin >= 0.0f)) {
-    if (now - lastAutoCycleTime >= 5UL * 60UL * 1000UL) { // Cooldown darurat 5 menit
+  if (!isnan(agriSoilMin) && (agriSoilMin > 5.0f) && (agriSoilMin <= ambangKritis)) {
+    if (now - lastAutoCycleTime >= COOLDOWN_AGRI_MS) { // Jeda 15 menit agar air meresap ke sensor sebelum siklus darurat berikutnya
       float volDarurat = hitungTargetVolumeAir(agriSoilMin, vpdAgri, 65.0f, agriTemp, agriRh);
       volDarurat = max(volDarurat, 1.2f); // Minimal 1.2 L untuk penyelamatan
 
@@ -1570,17 +1598,15 @@ void evaluasiAktuatorOtomatis() {
       }
     }
   } else {
-    // Fallback bila waktu NTP belum sinkron
-    if (lastFertigasiTimestamp == 0 || (now - lastFertigasiTimestamp >= (intervalHariFertigasi * 24UL * 3600UL * 1000UL))) {
-      hariFertigasiTiba = true;
-    }
+    // Jika waktu NTP belum sinkron, tunda fertigasi otomatis demi keselamatan tanaman
+    hariFertigasiTiba = false;
   }
 
-  bool dalamJendelaBiologis = timeValid ? isJendelaBiologis(curH, curM) : true;
+  bool dalamJendelaBiologis = timeValid ? isJendelaBiologis(curH, curM) : false;
   // 4C. EKSEKUSI CERDAS: FERTIGASI SIKLUS 3-TAHAP vs IRIGASI AIR BIASA (RESPON SENSORIK)
-  // Beraksi jika cooldown tercapai DAN (siklus histeresis aktif ATAU skor total >= ambang batas)
+  // Beraksi jika cooldown tercapai DAN (siklus histeresis aktif ATAU skor total >= ambang aktif 55/60)
   bool waktuAksiTiba = false;
-  if ((now - lastAutoCycleTime >= COOLDOWN_AGRI_MS) && (siklusIrigasiAktif || (skorTotal >= ambangSkorBawah))) {
+  if ((now - lastAutoCycleTime >= COOLDOWN_AGRI_MS) && (siklusIrigasiAktif || (skorTotal >= ambangSkorAktif))) {
     waktuAksiTiba = true;
   }
 
@@ -2127,6 +2153,17 @@ void updateDynamicValues() {
   tft.drawString(footer, 10, 303);
 }
 
+// =========================================================================
+// AUTO-RECOVERY TFT DISPLAY (PULIHKAN JIKA TERKENA SPIKE LISTRIK / BLANK PUTIH)
+// =========================================================================
+void recoverTftDisplay() {
+  Serial.println(F("[TFT] Memulihkan inisialisasi register layar LCD setelah gangguan transien..."));
+  tft.init();
+  tft.setRotation(3);
+  drawStaticDashboard();
+  updateDynamicValues();
+}
+
 // =====================================================
 // KONFIGURASI WIFI DINAMIS DENGAN AUTO-ROLLBACK
 // =====================================================
@@ -2204,7 +2241,43 @@ void applyNewWiFi(const String& newSsid, const String& newPass) {
 // =====================================================
 // MQTT CALLBACK (Perintah dari Web Dashboard)
 // =====================================================
+String redactMqttPassword(const String& payload) {
+  int keyIndex = payload.indexOf("\"password\"");
+  if (keyIndex < 0) return payload;
+
+  int colonIndex = payload.indexOf(':', keyIndex + 10);
+  if (colonIndex < 0) return payload;
+
+  int valueStart = colonIndex + 1;
+  while (valueStart < payload.length() &&
+         (payload.charAt(valueStart) == ' ' || payload.charAt(valueStart) == '\t' ||
+          payload.charAt(valueStart) == '\r' || payload.charAt(valueStart) == '\n')) {
+    valueStart++;
+  }
+  if (valueStart >= payload.length()) return payload;
+
+  int valueEnd = valueStart;
+  if (payload.charAt(valueStart) == '"') {
+    valueEnd++;
+    bool escaped = false;
+    while (valueEnd < payload.length()) {
+      char c = payload.charAt(valueEnd++);
+      if (c == '"' && !escaped) break;
+      if (c == '\\' && !escaped) escaped = true;
+      else escaped = false;
+    }
+  } else {
+    while (valueEnd < payload.length() &&
+           payload.charAt(valueEnd) != ',' && payload.charAt(valueEnd) != '}') {
+      valueEnd++;
+    }
+  }
+
+  return payload.substring(0, valueStart) + "\"[REDACTED]\"" + payload.substring(valueEnd);
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  static uint32_t receivedMessageCount = 0;
   String strTopic = String(topic);
   String strPayload = "";
   for (unsigned int i = 0; i < length; i++) {
@@ -2212,16 +2285,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   strPayload.trim();
 
+  String logPayload = redactMqttPassword(strPayload);
+  Serial.printf("\n[MQTT RX #%lu] uptime=%lu ms | topic=%s | length=%u bytes\n  payload=%s\n",
+                (unsigned long)++receivedMessageCount,
+                millis(),
+                topic,
+                length,
+                logPayload.c_str());
+
   // KRUSIAL: Abaikan pesan status atau telemetry agar tidak terjadi feedback loop tak terhingga.
   if (strTopic.indexOf("/status") >= 0 || strTopic.indexOf("/sensor/") >= 0) {
     return;
   }
-
-  // CETAK SETIAP PERINTAH DARI WEB KE SERIAL MONITOR
-  Serial.println(F("\n================================================="));
-  Serial.printf("[RX <- WEB] Topik   : %s\n", topic);
-  Serial.printf("[RX <- WEB] Perintah: %s\n", strPayload.c_str());
-  Serial.println(F("================================================="));
 
   // 1. Mode Sistem (Auto / Manual) — Simpan ke Flash NVS
   if (strTopic.endsWith("/mode/cmd") || strTopic.indexOf("mode") >= 0) {
@@ -2252,7 +2327,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   // 2. Kontrol Pompa / Irigasi
-  if (strTopic.endsWith("/irigasi/cmd") || strTopic.endsWith("/pompa/cmd") || strTopic.indexOf("irigasi") >= 0 || strTopic.indexOf("pompa") >= 0) {
+  if (strTopic.endsWith("/irigasi/cmd") || strTopic.endsWith("/pompa/cmd") || strTopic == "sproutai/irigasi/cmd" || strTopic == "sproutai/pompa/cmd") {
     if (strPayload.equalsIgnoreCase("on") || strPayload.equalsIgnoreCase("1") || strPayload.equalsIgnoreCase("true") || strPayload.indexOf("\"on\"") >= 0 || strPayload.indexOf("pump_on") >= 0) {
       float target = modeSistem.equalsIgnoreCase("MANUAL") ? 999.0f : 1.5f;
       startIrigasi(target, false, 0.0f, false);
@@ -2265,7 +2340,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   // 3. Kontrol Fertigasi
-  if (strTopic.endsWith("/fertigasi/cmd") || strTopic.indexOf("fertigasi") >= 0) {
+  if (strTopic.endsWith("/fertigasi/cmd") || strTopic == "sproutai/fertigasi/cmd") {
     if (strPayload.equalsIgnoreCase("on") || strPayload.equalsIgnoreCase("1") || strPayload.equalsIgnoreCase("true") || strPayload.indexOf("\"on\"") >= 0) {
       float target = modeSistem.equalsIgnoreCase("MANUAL") ? 999.0f : 1.0f;
       startFertigasi(target, false);
@@ -2274,6 +2349,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       stopAllActuators("CMD_OFF_FERTIGASI");
       Serial.println(F("[AKTUATOR] Fertigasi dimatikan"));
     }
+    return;
+  }
+
+  // 3b. Reset / Recover LCD TFT (Jika Layar Blank Putih akibat Noise Relay)
+  if (strTopic.endsWith("/lcd/cmd") || strTopic.endsWith("/display/cmd") || strTopic == "sproutai/lcd/cmd" || strTopic == "sproutai/display/reset") {
+    recoverTftDisplay();
+    Serial.println(F("[TFT] Manual recovery LCD berhasil dijalankan dari MQTT!"));
     return;
   }
 
@@ -2295,17 +2377,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // 5. AI Action
-  if (strTopic.startsWith("sproutai/ai/") || strTopic.indexOf("ai/action") >= 0) {
-    if (strPayload.indexOf("\"pump\":\"ON\"") >= 0 || strPayload.indexOf("\"pump\":\"on\"") >= 0 || strPayload.indexOf("pump_on") >= 0) {
-      startIrigasi(0.5f, false, 0.0f, false);
-    } else if (strPayload.indexOf("\"pump\":\"OFF\"") >= 0 || strPayload.indexOf("\"pump\":\"off\"") >= 0 || strPayload.indexOf("pump_off") >= 0) {
-      stopAllActuators("CMD_AI_OFF");
-    }
-    return;
-  }
-
-  // 6. Data Cuaca BMKG Eksternal (Kecepatan Angin untuk FWI ISI)
+  // 5. Data Cuaca BMKG Eksternal (Kecepatan Angin untuk FWI ISI)
   if (strTopic.indexOf("weather/wind") >= 0 || strTopic.indexOf("angin") >= 0) {
     float w = strPayload.toFloat();
     if (w >= 0.0f) {
@@ -2314,7 +2386,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // 7. Pengaturan Lengkap dari Web Dashboard (sproutai/settings/cmd)
+  // 6. Pengaturan Lengkap dari Web Dashboard (sproutai/settings/cmd)
   if (strTopic.endsWith("/settings/cmd") || strTopic.indexOf("settings") >= 0) {
     JsonDocument setDoc;
     DeserializationError err = deserializeJson(setDoc, strPayload);
@@ -3037,8 +3109,9 @@ void ensureMqttConnection() {
         mqttClient.subscribe("sproutai/settings/cmd");
         mqttClient.subscribe("sproutai/schedule/cmd");
         mqttClient.subscribe("sproutai/time/cmd");
-        mqttClient.subscribe("sproutai/ai/#");
         mqttClient.subscribe("sproutai/weather/#");
+        mqttClient.subscribe("sproutai/lcd/cmd");
+        mqttClient.subscribe("sproutai/display/reset");
         Serial.println(F("[MQTT] Berhasil subscribe seluruh perintah Web Dashboard!\n"));
 
         // Publikasikan status terkini langsung ke broker (dengan retained = true)
@@ -3066,6 +3139,7 @@ void TaskCore0_Network(void *pvParameters) {
   unsigned long lastMqttCheck = 0;
   unsigned long lastBufferFlush = 0;
   unsigned long lastStatusPing = 0;
+  unsigned long lastHealthPrint = 0;
 
   for (;;) {
     ensureWiFiConnection();
@@ -3093,6 +3167,15 @@ void TaskCore0_Network(void *pvParameters) {
       lastBufferFlush = millis();
     }
 
+    if (millis() - lastHealthPrint >= 60000) {
+      lastHealthPrint = millis();
+      Serial.printf("[HEALTH] Heap free=%u min=%u largest=%u TaskCore0 stack=%u\n",
+                    ESP.getFreeHeap(),
+                    ESP.getMinFreeHeap(),
+                    heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                    uxTaskGetStackHighWaterMark(NULL));
+    }
+
     vTaskDelay(pdMS_TO_TICKS(15)); // Jeda 15ms untuk FreeRTOS scheduler Core 0
   }
 }
@@ -3103,6 +3186,28 @@ void TaskCore0_Network(void *pvParameters) {
 void setup() {
   Serial.begin(115200);
   delay(400);
+
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  Serial.println(F("\n[BOOT] Riwayat reset/rehubungan ESP32"));
+  Serial.printf("[BOOT] Reset reason: %d (", (int)resetReason);
+  switch (resetReason) {
+    case ESP_RST_POWERON: Serial.print("POWERON"); break;
+    case ESP_RST_EXT: Serial.print("EXTERNAL_RESET"); break;
+    case ESP_RST_SW: Serial.print("SOFTWARE_RESET"); break;
+    case ESP_RST_PANIC: Serial.print("PANIC"); break;
+    case ESP_RST_INT_WDT: Serial.print("INTERRUPT_WDT"); break;
+    case ESP_RST_TASK_WDT: Serial.print("TASK_WDT"); break;
+    case ESP_RST_WDT: Serial.print("OTHER_WDT"); break;
+    case ESP_RST_DEEPSLEEP: Serial.print("DEEP_SLEEP"); break;
+    case ESP_RST_BROWNOUT: Serial.print("BROWNOUT/VOLTAGE_DROP"); break;
+    case ESP_RST_SDIO: Serial.print("SDIO"); break;
+    default: Serial.print("UNKNOWN"); break;
+  }
+  Serial.println(")");
+  Serial.printf("[BOOT] Free heap=%u | Minimum heap=%u | Largest block=%u\n",
+                ESP.getFreeHeap(),
+                ESP.getMinFreeHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   // Muat konfigurasi tersimpan dari Flash NVS
   prefs.begin("teranova", false);
   String lastDefSsid = prefs.getString("def_ssid", "");
@@ -3159,6 +3264,10 @@ void setup() {
   // Inisialisasi Aktuator & Sensor Analog pH & Waterflow
   initActuatorHardware();
 
+  // Enforce cooldown saat boot agar sistem tidak langsung memicu irigasi/fertigasi otomatis seketika saat nyala
+  lastAutoCycleTime = millis();
+  lastFertigasiTimestamp = millis();
+
   // Inisialisasi TFT Display (ILI9488 SPI)
   tft.init();
   tft.setRotation(3); // 3 = Landscape Terbalik 180° (480x320)
@@ -3174,11 +3283,15 @@ void setup() {
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setKeepAlive(15);
-  mqttClient.setBufferSize(512);
+  if (!mqttClient.setBufferSize(2048)) {
+    Serial.println(F("[MQTT] ERROR: gagal mengalokasikan buffer paket 2048 byte."));
+  } else {
+    Serial.printf("[MQTT] Buffer paket: %u byte\n", mqttClient.getBufferSize());
+  }
   secureClient.setInsecure();
-  secureClient.setTimeout(2);
-  secureClient.setHandshakeTimeout(3);
-  mqttClient.setSocketTimeout(2);
+  secureClient.setTimeout(8);
+  secureClient.setHandshakeTimeout(10);
+  mqttClient.setSocketTimeout(8);
 
   // Launch Core 0 Task untuk Jaringan & Komunikasi
   xTaskCreatePinnedToCore(
